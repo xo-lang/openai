@@ -1,0 +1,330 @@
+// The OpenAI client and its request engine.
+//
+// Ported from github.com/openai/openai-go v3.98.0 (client.go, option,
+// internal/requestconfig, internal/apierror), Copyright 2026 OpenAI,
+// Apache License 2.0. Changed from the original: rewritten in Xo; the
+// request options are an Options value and per-call hooks; the client
+// names itself as Xo (NOTICE.md).
+
+use std/http
+use std/json
+use std/time
+use std/url
+
+/// The openai-go release this port follows.
+pub const PACKAGE_VERSION: Str = "3.98.0"
+
+/// Go's default base URL (option.WithEnvironmentProduction).
+pub const DEFAULT_BASE_URL: Str = "https://api.openai.com/v1/"
+
+/// The longest backoff between tries (Go's DefaultMaxServerDelay, 8 s).
+const MAX_BACKOFF_MS: Int = 8000
+
+/// The longest Retry-After the client waits for (Go's
+/// defaultMaxRetryAfterDelay, 2 minutes); a longer one ends the retries.
+const MAX_RETRY_AFTER_MS: Int = 120000
+
+/// A per-call step run once before the tries (Go's middleware for what
+/// this port needs: the Azure add-on's path rewrite, `api-version` and
+/// authentication). An Err stops the call without a try.
+pub type Hook[fx: Effects] = fn(http.Request) -> http.Request ! Str uses (net.dial, clock, rand, fx)
+
+/// The client's options (Go's option.RequestOption values for the
+/// client).
+pub struct Options[fx: Effects] {
+  /// The base URL, ending with `/` (one is added when missing).
+  pub base_url: Str = DEFAULT_BASE_URL
+  /// Sent as `Authorization: Bearer <key>` when not empty.
+  pub api_key: Str = ""
+  /// `OpenAI-Organization` when not empty.
+  pub organization: Str = ""
+  /// `OpenAI-Project` when not empty.
+  pub project: Str = ""
+  /// Extra headers (set after the client's own, replacing them).
+  pub headers: List[(Str, Str)] = []
+  /// Extra query values (added to every request).
+  pub query: List[(Str, Str)] = []
+  /// Retries after the first try (Go's default 2).
+  pub max_retries: Int = 2
+  /// Each try's time limit; zero for none (Go's WithRequestTimeout, also
+  /// sent as `X-Stainless-Timeout` in seconds).
+  pub request_timeout: Duration = 0s
+  /// Steps run once per call, in order, before the tries.
+  pub hooks: List[Hook[fx]] = []
+}
+
+/// What one call changes (Go's per-call request options).
+pub struct CallOptions {
+  /// In place of the client's max_retries.
+  pub max_retries: Int? = None
+  pub headers: List[(Str, Str)] = []
+  pub query: List[(Str, Str)] = []
+}
+
+/// An error of a call.
+pub enum OpenAIErr {
+  /// The API answered with an error status (Go's *openai.Error): its
+  /// status and the body's `error` object (fields empty when the body is
+  /// not JSON).
+  Api(status: Int, code: Str, kind: Str, param: Str, message: Str, body: Str)
+  /// No response after the last try.
+  Transport(msg: Str)
+  /// The call stopped before a try (a hook's error, a bad option).
+  Request(msg: Str)
+  /// The response's body did not decode.
+  Decode(msg: Str)
+  /// A stream ended with an error event (Go's `received error while
+  /// streaming: <data>`).
+  Stream(msg: Str)
+}
+
+/// Go's texts: `OpenAI API error: <status> <status text>` for Api.
+pub fn (e: OpenAIErr) display() -> Str {
+  match e {
+    OpenAIErr.Api(status, _, _, _, _, _) => {
+      let t = http.status_text(status)
+      if t == "" { "OpenAI API error: ${status}" } else { "OpenAI API error: ${status} ${t}" }
+    }
+    OpenAIErr.Transport(m) => m
+    OpenAIErr.Request(m) => m
+    OpenAIErr.Decode(m) => m
+    OpenAIErr.Stream(m) => "received error while streaming: ${m}"
+  }
+}
+
+/// An OpenAI API client (Go's openai.Client).
+pub struct Client[fx: Effects] {
+  http: http.Client
+  clock: Clock
+  rand: Rand
+  o: Options[fx]
+}
+
+/// A client sending through `net` (Go's openai.NewClient with these
+/// options; no environment variables are read: see `from_env`).
+pub fn new_client[fx: Effects](net: Net, clock: Clock, rand: Rand, o: Options[fx]) -> Client[fx] {
+  Client{http: http.client(net, timeout: 600s), clock: clock, rand: rand, o: o}
+}
+
+/// Go's DefaultClientOptions: OPENAI_BASE_URL, OPENAI_API_KEY,
+/// OPENAI_ORG_ID and OPENAI_PROJECT_ID, when set, over `o`.
+pub fn from_env[fx: Effects](env: Env, o: Options[fx]) -> Options[fx] uses env {
+  var r = o
+  if let Some(v) = env.get("OPENAI_BASE_URL") {
+    r.base_url = v
+  }
+  if let Some(v) = env.get("OPENAI_API_KEY") {
+    r.api_key = v
+  }
+  if let Some(v) = env.get("OPENAI_ORG_ID") {
+    r.organization = v
+  }
+  if let Some(v) = env.get("OPENAI_PROJECT_ID") {
+    r.project = v
+  }
+  r
+}
+
+/// Go's normalized OS name (X-Stainless-OS).
+fn os_name() -> Str {
+  match target.os {
+    Linux => "Linux"
+    Darwin => "MacOS"
+    Windows => "Windows"
+    Wasi => "other:wasip1"
+  }
+}
+
+/// Go's normalized architecture (X-Stainless-Arch).
+fn arch_name() -> Str {
+  match target.arch {
+    Amd64 => "x64"
+    Arm64 => "arm64"
+    Wasm32 => "other:wasm"
+  }
+}
+
+/// The base URL with one trailing `/`.
+fn (c: Client[fx]) base() -> Str {
+  if c.o.base_url.ends_with("/") { c.o.base_url } else { "${c.o.base_url}/" }
+}
+
+/// The request a call starts from: the URL, Go's headers, the body.
+fn (c: Client[fx]) build(method: Str, path: Str, body: json.Value?, co: CallOptions) -> http.Request {
+  var u = c.base() + path.trim_prefix("/")
+  var q: List[Str] = []
+  for (k, v) in c.o.query + co.query {
+    q.push("${url.query_escape(k)}=${url.query_escape(v)}")
+  }
+  if !q.is_empty() {
+    u = "${u}${if u.contains("?") { "&" } else { "?" }}${q.join("&")}"
+  }
+  var hs: Map[Str, Str] = {
+    "Accept": "application/json",
+    "User-Agent": "OpenAI/Xo ${PACKAGE_VERSION}",
+    "X-Stainless-Lang": "xo",
+    "X-Stainless-Package-Version": PACKAGE_VERSION,
+    "X-Stainless-OS": os_name(),
+    "X-Stainless-Arch": arch_name(),
+    "X-Stainless-Runtime": "xo",
+    "X-Stainless-Runtime-Version": "preview",
+  }
+  if c.o.api_key != "" {
+    hs["Authorization"] = "Bearer ${c.o.api_key}"
+  }
+  if c.o.organization != "" {
+    hs["OpenAI-Organization"] = c.o.organization
+  }
+  if c.o.project != "" {
+    hs["OpenAI-Project"] = c.o.project
+  }
+  if c.o.request_timeout > 0s {
+    hs["X-Stainless-Timeout"] = "${c.o.request_timeout.millis() / 1000}"
+  }
+  var b = b""
+  if let Some(v) = body {
+    hs["Content-Type"] = "application/json"
+    b = v.encode().bytes()
+  }
+  for (k, v) in c.o.headers + co.headers {
+    hs[k] = v
+  }
+  var r = http.new_request(method, u, headers: hs, body: b)
+  if c.o.request_timeout > 0s {
+    r = r.with_timeout(c.o.request_timeout)
+  }
+  r
+}
+
+/// Whether Go retries after this response (shouldRetry): x-should-retry
+/// first, then 408, 409, 429 and 500 and above.
+fn should_retry(r: http.Response) -> Bool {
+  match r.header("x-should-retry") {
+    Some("true") => return true
+    Some("false") => return false
+    _ => {}
+  }
+  r.status == 408 || r.status == 409 || r.status == 429 || r.status >= 500
+}
+
+/// Go's parseRetryAfterHeader: Retry-After-Ms, then Retry-After (seconds
+/// or an HTTP date). Some((ms, over)): `over` when it is past the
+/// maximum (no retry then); None when neither header gives a delay.
+fn retry_after(r: http.Response, now: Time) -> (Int, Bool)? {
+  for (h, unit) in [("Retry-After-Ms", 1.0), ("Retry-After", 1000.0)] {
+    let v = r.header(h) ?? continue
+    if v == "" {
+      continue
+    }
+    if let Some(n) = Float.parse(v) {
+      if !n.is_nan() && (n - n).is_nan() && n > 0.0 {
+        return Some((0, true))
+      }
+      if n.is_nan() || (n - n).is_nan() || n < 0.0 {
+        continue
+      }
+      let ms = n * unit
+      if ms > Float(MAX_RETRY_AFTER_MS) {
+        return Some((0, true))
+      }
+      return Some((Int(ms), false))
+    }
+    if h == "Retry-After" {
+      if let Ok(t) = time.parse(v, time.RFC1123, time.utc()) {
+        let d = t.unix_millis() - now.unix_millis()
+        if d <= 0 {
+          return Some((0, false))
+        }
+        if d > MAX_RETRY_AFTER_MS {
+          return Some((0, true))
+        }
+        return Some((d, false))
+      }
+    }
+  }
+  None
+}
+
+/// Go's retryDelay: the server's delay, else 0.5 s * 2^n capped at 8 s,
+/// less up to a quarter of jitter. None: do not retry.
+fn (c: Client[fx]) retry_delay(r: http.Response?, n: Int) -> Duration? uses (clock, rand) {
+  if let Some(resp) = r {
+    if let Some((ms, over)) = retry_after(resp, c.clock.now()) {
+      return if over { None } else { Some(Duration.from_millis(ms)) }
+    }
+  }
+  var ms = 500
+  for _ in 0..n {
+    ms = ms * 2
+    if ms >= MAX_BACKOFF_MS {
+      ms = MAX_BACKOFF_MS
+      break
+    }
+  }
+  let jitter = ms / 4
+  if jitter > 0 {
+    ms = ms - c.rand.int(0, jitter)
+  }
+  Some(Duration.from_millis(ms))
+}
+
+/// The API error of a response with an error status.
+fn api_err(r: http.Response) -> OpenAIErr {
+  let body = r.body.to_str_lossy()
+  let e = match json.parse_value(body) {
+    Ok(v) => v.get("error") ?? json.Value.Null
+    Err(_) => json.Value.Null
+  }
+  let s = fn(k: Str) -> Str {
+    match e.get(k) {
+      Some(json.Value.Str(x)) => x
+      _ => ""
+    }
+  }
+  OpenAIErr.Api(status: r.status, code: s("code"), kind: s("type"), param: s("param"), message: s("message"), body: body)
+}
+
+/// A call: the hooks once, then the tries with Go's retry rules. An
+/// error status after the last try is Api.
+pub fn (c: Client[fx]) execute(method: Str, path: Str, body: json.Value?, co: CallOptions = CallOptions{}) -> http.Response ! OpenAIErr uses (net.dial, clock, rand, fx) {
+  var req = c.build(method, path, body, co)
+  for h in c.o.hooks {
+    req = h(req) ?? e => return Err(OpenAIErr.Request(e))
+  }
+  let max = co.max_retries ?? c.o.max_retries
+  var n = 0
+  while {
+    let try_req = req.with_header("X-Stainless-Retry-Count", "${n}")
+    match c.http.send(try_req) {
+      Ok(resp) => {
+        if n < max && should_retry(resp) {
+          if let Some(d) = c.retry_delay(Some(resp), n) {
+            c.clock.sleep(d)
+            n = n + 1
+            continue
+          }
+        }
+        if resp.status >= 400 {
+          return Err(api_err(resp))
+        }
+        return Ok(resp)
+      }
+      Err(e) => {
+        if n < max {
+          if let Some(d) = c.retry_delay(None, n) {
+            c.clock.sleep(d)
+            n = n + 1
+            continue
+          }
+        }
+        return Err(OpenAIErr.Transport(e.display()))
+      }
+    }
+  }
+}
+
+/// A call whose response is JSON, decoded.
+pub fn (c: Client[fx]) call_json(method: Str, path: Str, body: json.Value?, co: CallOptions = CallOptions{}) -> json.Value ! OpenAIErr uses (net.dial, clock, rand, fx) {
+  let r = c.execute(method, path, body, co)?
+  json.parse_value(r.body.to_str_lossy()) ?? e => Err(OpenAIErr.Decode(e.display()))
+}

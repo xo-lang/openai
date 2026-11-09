@@ -1,0 +1,368 @@
+// Chat completions: the request parameters and the completion.
+//
+// Ported from github.com/openai/openai-go v3.98.0 (chatcompletion.go,
+// shared/shared.go), Copyright 2026 OpenAI, Apache License 2.0. Changed
+// from the original: rewritten in Xo; a subset of the parameters (the
+// rest through `extra`); messages with text content (NOTICE.md).
+
+use std/json
+
+/// A tool call an assistant message made (Go's
+/// ChatCompletionMessageFunctionToolCallParam and ...ToolCall).
+pub struct ToolCall {
+  pub id: Str
+  pub name: Str
+  /// The arguments as the model wrote them, JSON text.
+  pub arguments: Str
+}
+
+/// A message of the conversation (Go's ChatCompletionMessageParamUnion,
+/// text content only).
+pub enum Message {
+  System(content: Str, name: Str)
+  Developer(content: Str, name: Str)
+  User(content: Str, name: Str)
+  /// An assistant's earlier turn: its text (None with tool calls only),
+  /// its tool calls, a refusal.
+  Assistant(content: Str?, tool_calls: List[ToolCall], name: Str, refusal: Str?)
+  /// A tool's result for a tool call.
+  Tool(content: Str, tool_call_id: Str)
+}
+
+pub fn system_message(content: Str, name: Str = "") -> Message {
+  Message.System(content: content, name: name)
+}
+
+pub fn developer_message(content: Str, name: Str = "") -> Message {
+  Message.Developer(content: content, name: name)
+}
+
+pub fn user_message(content: Str, name: Str = "") -> Message {
+  Message.User(content: content, name: name)
+}
+
+pub fn assistant_message(content: Str?, tool_calls: List[ToolCall] = [], name: Str = "", refusal: Str? = None) -> Message {
+  Message.Assistant(content: content, tool_calls: tool_calls, name: name, refusal: refusal)
+}
+
+pub fn tool_message(content: Str, tool_call_id: Str) -> Message {
+  Message.Tool(content: content, tool_call_id: tool_call_id)
+}
+
+/// A function the model may call (Go's FunctionDefinitionParam in a
+/// ChatCompletionFunctionToolParam).
+pub struct Tool {
+  pub name: Str
+  pub description: Str = ""
+  /// The JSON Schema of its arguments; written with sorted keys, as Go
+  /// writes its map.
+  pub parameters: json.Value? = None
+  pub strict: Bool? = None
+}
+
+/// Go's ChatCompletionToolChoiceOptionUnionParam.
+pub enum ToolChoice {
+  Auto
+  NoTool
+  Required
+  /// This function.
+  Function(name: Str)
+}
+
+/// Go's ChatCompletionNewParamsResponseFormatUnion.
+pub enum ResponseFormat {
+  Text
+  JsonObject
+  JsonSchema(name: Str, schema: json.Value, description: Str, strict: Bool?)
+}
+
+/// Go's ChatCompletionNewParamsStopUnion.
+pub enum Stop {
+  One(s: Str)
+  Many(xs: List[Str])
+}
+
+/// Go's ChatCompletionNewParams (a subset; any other field in `extra`).
+pub struct ChatParams {
+  pub model: Str
+  pub messages: List[Message]
+  pub frequency_penalty: Float? = None
+  pub logprobs: Bool? = None
+  pub max_completion_tokens: Int? = None
+  pub max_tokens: Int? = None
+  pub n: Int? = None
+  pub presence_penalty: Float? = None
+  pub prompt_cache_key: Str? = None
+  pub safety_identifier: Str? = None
+  pub seed: Int? = None
+  pub store: Bool? = None
+  pub temperature: Float? = None
+  pub top_logprobs: Int? = None
+  pub top_p: Float? = None
+  pub parallel_tool_calls: Bool? = None
+  pub user: Str? = None
+  pub metadata: List[(Str, Str)] = []
+  pub reasoning_effort: Str? = None
+  pub service_tier: Str? = None
+  pub stop: Stop? = None
+  /// Sent with a stream (Go's ChatCompletionStreamOptionsParam).
+  pub include_usage: Bool? = None
+  pub verbosity: Str? = None
+  pub response_format: ResponseFormat? = None
+  pub tool_choice: ToolChoice? = None
+  pub tools: List[Tool] = []
+  /// More fields, written after the others in this order (Go's
+  /// option.WithJSONSet).
+  pub extra: List[(Str, json.Value)] = []
+}
+
+fn jstr(s: Str) -> json.Value {
+  json.Value.Str(s)
+}
+
+/// `v` with every object's keys sorted, as Go writes a map.
+fn sorted(v: json.Value) -> json.Value {
+  match v {
+    json.Value.Object(xs) => json.Value.Object(xs.map(fn(x: (Str, json.Value)) -> (Str, json.Value) { (x.0, sorted(x.1)) }).sort_by(fn(x: (Str, json.Value)) -> Str { x.0 }))
+    json.Value.List(xs) => json.Value.List(xs.map(sorted))
+    _ => v
+  }
+}
+
+fn message_json(m: Message) -> json.Value {
+  let text = fn(content: Str, name: Str, role: Str) -> json.Value {
+    var f: List[(Str, json.Value)] = [("content", jstr(content))]
+    if name != "" {
+      f.push(("name", jstr(name)))
+    }
+    f.push(("role", jstr(role)))
+    json.Value.Object(f)
+  }
+  match m {
+    Message.System(c, n) => text(c, n, "system")
+    Message.Developer(c, n) => text(c, n, "developer")
+    Message.User(c, n) => text(c, n, "user")
+    Message.Assistant(c, calls, n, refusal) => {
+      var f: List[(Str, json.Value)] = []
+      if let Some(r) = refusal {
+        f.push(("refusal", jstr(r)))
+      }
+      if n != "" {
+        f.push(("name", jstr(n)))
+      }
+      if let Some(t) = c {
+        f.push(("content", jstr(t)))
+      }
+      if !calls.is_empty() {
+        f.push(("tool_calls", json.Value.List(calls.map(fn(tc: ToolCall) -> json.Value {
+          json.Value.Object([("id", jstr(tc.id)), ("function", json.Value.Object([("arguments", jstr(tc.arguments)), ("name", jstr(tc.name))])), ("type", jstr("function"))])
+        }))))
+      }
+      f.push(("role", jstr("assistant")))
+      json.Value.Object(f)
+    }
+    Message.Tool(c, id) => json.Value.Object([("content", jstr(c)), ("tool_call_id", jstr(id)), ("role", jstr("tool"))])
+  }
+}
+
+fn tool_json(t: Tool) -> json.Value {
+  var f: List[(Str, json.Value)] = [("name", jstr(t.name))]
+  if let Some(s) = t.strict {
+    f.push(("strict", json.Value.Bool(s)))
+  }
+  if t.description != "" {
+    f.push(("description", jstr(t.description)))
+  }
+  if let Some(p) = t.parameters {
+    f.push(("parameters", sorted(p)))
+  }
+  json.Value.Object([("function", json.Value.Object(f)), ("type", jstr("function"))])
+}
+
+fn opt_num(k: Str, v: Float?) -> List[(Str, json.Value)] {
+  match v {
+    Some(x) => [(k, json.Value.Num(x))]
+    None => []
+  }
+}
+
+fn opt_int(k: Str, v: Int?) -> List[(Str, json.Value)] {
+  match v {
+    Some(x) => [(k, json.Value.Int(x))]
+    None => []
+  }
+}
+
+fn opt_boo(k: Str, v: Bool?) -> List[(Str, json.Value)] {
+  match v {
+    Some(x) => [(k, json.Value.Bool(x))]
+    None => []
+  }
+}
+
+fn opt_str(k: Str, v: Str?) -> List[(Str, json.Value)] {
+  match v {
+    Some(x) => [(k, jstr(x))]
+    None => []
+  }
+}
+
+/// The request body in Go's field order; `stream` adds Go's
+/// `"stream": true` last.
+pub fn (p: ChatParams) to_json(stream: Bool = false) -> json.Value {
+  var f: List[(Str, json.Value)] = [("messages", json.Value.List(p.messages.map(message_json))), ("model", jstr(p.model))]
+  f = f + opt_num("frequency_penalty", p.frequency_penalty)
+  f = f + opt_boo("logprobs", p.logprobs)
+  f = f + opt_int("max_completion_tokens", p.max_completion_tokens)
+  f = f + opt_int("max_tokens", p.max_tokens)
+  f = f + opt_int("n", p.n)
+  f = f + opt_num("presence_penalty", p.presence_penalty)
+  f = f + opt_str("prompt_cache_key", p.prompt_cache_key)
+  f = f + opt_str("safety_identifier", p.safety_identifier)
+  f = f + opt_int("seed", p.seed)
+  f = f + opt_boo("store", p.store)
+  f = f + opt_num("temperature", p.temperature)
+  f = f + opt_int("top_logprobs", p.top_logprobs)
+  f = f + opt_num("top_p", p.top_p)
+  f = f + opt_boo("parallel_tool_calls", p.parallel_tool_calls)
+  f = f + opt_str("user", p.user)
+  if !p.metadata.is_empty() {
+    f.push(("metadata", sorted(json.Value.Object(p.metadata.map(fn(x: (Str, Str)) -> (Str, json.Value) { (x.0, jstr(x.1)) })))))
+  }
+  f = f + opt_str("reasoning_effort", p.reasoning_effort)
+  f = f + opt_str("service_tier", p.service_tier)
+  if let Some(s) = p.stop {
+    f.push(("stop", match s {
+      Stop.One(x) => jstr(x)
+      Stop.Many(xs) => json.Value.List(xs.map(jstr))
+    }))
+  }
+  if let Some(u) = p.include_usage {
+    f.push(("stream_options", json.Value.Object([("include_usage", json.Value.Bool(u))])))
+  }
+  f = f + opt_str("verbosity", p.verbosity)
+  if let Some(rf) = p.response_format {
+    f.push(("response_format", match rf {
+      ResponseFormat.Text => json.Value.Object([("type", jstr("text"))])
+      ResponseFormat.JsonObject => json.Value.Object([("type", jstr("json_object"))])
+      ResponseFormat.JsonSchema(name, schema, desc, strict) => {
+        var s: List[(Str, json.Value)] = [("name", jstr(name))]
+        if let Some(b) = strict {
+          s.push(("strict", json.Value.Bool(b)))
+        }
+        if desc != "" {
+          s.push(("description", jstr(desc)))
+        }
+        s.push(("schema", sorted(schema)))
+        json.Value.Object([("json_schema", json.Value.Object(s)), ("type", jstr("json_schema"))])
+      }
+    }))
+  }
+  if let Some(tc) = p.tool_choice {
+    f.push(("tool_choice", match tc {
+      ToolChoice.Auto => jstr("auto")
+      ToolChoice.NoTool => jstr("none")
+      ToolChoice.Required => jstr("required")
+      ToolChoice.Function(name) => json.Value.Object([("function", json.Value.Object([("name", jstr(name))])), ("type", jstr("function"))])
+    }))
+  }
+  if !p.tools.is_empty() {
+    f.push(("tools", json.Value.List(p.tools.map(tool_json))))
+  }
+  for x in p.extra {
+    f.push(x)
+  }
+  if stream {
+    f.push(("stream", json.Value.Bool(true)))
+  }
+  json.Value.Object(f)
+}
+
+/// Token counts (Go's CompletionUsage, its totals).
+pub struct Usage {
+  pub prompt_tokens: Int = 0
+  pub completion_tokens: Int = 0
+  pub total_tokens: Int = 0
+}
+
+/// The assistant's message of a choice (Go's ChatCompletionMessage).
+pub struct ChatMessage {
+  pub role: Str = ""
+  /// "" when the model sent null.
+  pub content: Str = ""
+  pub refusal: Str = ""
+  pub tool_calls: List[ToolCall] = []
+}
+
+pub struct Choice {
+  pub index: Int = 0
+  pub finish_reason: Str = ""
+  pub message: ChatMessage = ChatMessage{}
+}
+
+/// Go's ChatCompletion; `raw` is the whole response for any other field.
+pub struct ChatCompletion {
+  pub id: Str = ""
+  pub object: Str = ""
+  pub created: Int = 0
+  pub model: Str = ""
+  pub service_tier: Str = ""
+  pub system_fingerprint: Str = ""
+  pub choices: List[Choice] = []
+  pub usage: Usage = Usage{}
+  pub raw: json.Value = json.Value.Null
+}
+
+fn str_of(v: json.Value, k: Str) -> Str {
+  match v.get(k) {
+    Some(json.Value.Str(s)) => s
+    _ => ""
+  }
+}
+
+fn int_of(v: json.Value, k: Str) -> Int {
+  match v.get(k) {
+    Some(json.Value.Int(n)) => n
+    Some(json.Value.Num(f)) => Int(f)
+    _ => 0
+  }
+}
+
+fn list_of(v: json.Value, k: Str) -> List[json.Value] {
+  match v.get(k) {
+    Some(json.Value.List(xs)) => xs
+    _ => []
+  }
+}
+
+fn usage_of(v: json.Value) -> Usage {
+  let u = v.get("usage") ?? json.Value.Null
+  Usage{prompt_tokens: int_of(u, "prompt_tokens"), completion_tokens: int_of(u, "completion_tokens"), total_tokens: int_of(u, "total_tokens")}
+}
+
+fn tool_call_of(t: json.Value) -> ToolCall {
+  let f = t.get("function") ?? json.Value.Null
+  ToolCall{id: str_of(t, "id"), name: str_of(f, "name"), arguments: str_of(f, "arguments")}
+}
+
+fn completion_of(v: json.Value) -> ChatCompletion {
+  ChatCompletion{
+    id: str_of(v, "id"),
+    object: str_of(v, "object"),
+    created: int_of(v, "created"),
+    model: str_of(v, "model"),
+    service_tier: str_of(v, "service_tier"),
+    system_fingerprint: str_of(v, "system_fingerprint"),
+    choices: list_of(v, "choices").map(fn(c: json.Value) -> Choice {
+      let m = c.get("message") ?? json.Value.Null
+      Choice{index: int_of(c, "index"), finish_reason: str_of(c, "finish_reason"), message: ChatMessage{role: str_of(m, "role"), content: str_of(m, "content"), refusal: str_of(m, "refusal"), tool_calls: list_of(m, "tool_calls").map(tool_call_of)}}
+    }),
+    usage: usage_of(v),
+    raw: v,
+  }
+}
+
+/// Go's Chat.Completions.New: POST chat/completions.
+pub fn (c: Client[fx]) chat_completion(p: ChatParams, co: CallOptions = CallOptions{}) -> ChatCompletion ! OpenAIErr uses (net.dial, clock, rand, fx) {
+  Ok(completion_of(c.call_json("POST", "chat/completions", Some(p.to_json()), co)?))
+}

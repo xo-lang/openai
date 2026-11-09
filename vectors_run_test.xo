@@ -1,0 +1,228 @@
+// Replays the Go program's calls (vectors_test.xo) against the same fake:
+// reply queues per "METHOD path", the last reply repeating, every
+// request logged as the Go program logs it.
+
+use std/http
+use std/json
+use std/testing
+
+struct Fake {
+  section: Mutex[Str]
+  log: Mutex[List[Str]]
+  q: Mutex[Map[Str, List[(Int, List[(Str, Str)], Str)]]]
+}
+
+fn note(f: Fake, s: Str) {
+  f.log.with(fn(var l: List[Str]) { l.push(s) })
+}
+
+fn sec(f: Fake) -> Str {
+  f.section.with_read(fn(s: Str) -> Str { s })
+}
+
+const MASKED: List[Str] = ["x-stainless-os", "x-stainless-arch", "x-stainless-runtime-version"]
+
+fn answer(f: Fake, req: http.Request) -> http.Response {
+  var hs: List[Str] = []
+  for (k, v) in req.headers {
+    let lk = k.to_lower()
+    if lk == "accept-encoding" || lk == "content-length" || lk == "host" {
+      continue
+    }
+    hs.push("${lk}=${if MASKED.contains(lk) { "<${lk}>" } else { v }}")
+  }
+  let qs = req.raw_query()
+  note(f, "${sec(f)}: REQ ${req.method} ${req.escaped_path()}${if qs == "" { "" } else { "?${qs}" }}")
+  note(f, "  H ${hs.sort().join(" | ")}")
+  note(f, "  B ${req.body.to_str_lossy()}")
+  let key = "${req.method} ${req.url.path}"
+  let r = f.q.with(fn(var m: Map[Str, List[(Int, List[(Str, Str)], Str)]]) -> (Int, List[(Str, Str)], Str)? {
+    let rs = m.get(key) ?? return None
+    if rs.is_empty() {
+      return None
+    }
+    if rs.len() > 1 {
+      m[key] = rs[1..rs.len()]
+    }
+    Some(rs[0])
+  })
+  match r {
+    Some((st, hdrs, b)) => {
+      var resp = http.text(st, b)
+      var ct = "application/json"
+      for (k, v) in hdrs {
+        if k.to_lower() == "content-type" {
+          ct = v
+        } else {
+          resp.headers[k] = v
+        }
+      }
+      resp.headers["Content-Type"] = ct
+      resp
+    }
+    None => {
+      note(f, "${sec(f)}: NO REPLY for ${key}")
+      http.text(404, "{\"error\":{\"message\":\"no reply\",\"type\":\"fake\"}}")
+    }
+  }
+}
+
+fn serve(net: testing.FakeNet, host: Str) -> Fake {
+  let f = Fake{section: Mutex[Str].new(""), log: Mutex[List[Str]].new([]), q: Mutex[Map[Str, List[(Int, List[(Str, Str)], Str)]]].new({})}
+  let h = fn(req: http.Request) -> http.Response { answer(f, req) }
+  net.handle("POST https://${host}/{rest...}", h)
+  net.handle("GET https://${host}/{rest...}", h)
+  f
+}
+
+fn start(f: Fake, section: Str) {
+  f.section.with(fn(var s: Str) { s = section })
+  f.q.with(fn(var m: Map[Str, List[(Int, List[(Str, Str)], Str)]]) { m = {} })
+}
+
+fn on(f: Fake, key: Str, rs: List[(Int, List[(Str, Str)], Str)]) {
+  f.q.with(fn(var m: Map[Str, List[(Int, List[(Str, Str)], Str)]]) { m[key] = rs })
+}
+
+fn q(s: Str) -> Str {
+  json.encode_str(s)
+}
+
+/// Go's `%v` of a float64: the shortest text that round trips.
+fn gofloat(x: Float) -> Str {
+  x.to_general(-1)
+}
+
+fn show_err(f: Fake, label: Str, e: OpenAIErr) {
+  match e {
+    OpenAIErr.Api(status, code, kind, param, message, _) => note(f, "${sec(f)}: ${label}: error: ${e.display()} | status=${status} code=${q(code)} type=${q(kind)} param=${q(param)} message=${q(message)}")
+    OpenAIErr.Transport(_) | OpenAIErr.Request(_) | OpenAIErr.Decode(_) | OpenAIErr.Stream(_) => note(f, "${sec(f)}: ${label}: error: ${e.display()}")
+  }
+}
+
+fn show(f: Fake, label: Str, v: Str) {
+  note(f, "${sec(f)}: ${label}: ${v}")
+}
+
+/// The Go program's sections that this file replays, compared line by
+/// line in order.
+fn compare(f: Fake, sections: List[Str]) {
+  let want = GO_OPENAI_LINES.filter(fn(l: Str) -> Bool {
+    for s in sections {
+      if l.starts_with("${s}: ") {
+        return true
+      }
+    }
+    false
+  })
+  // a section's H and B lines follow its REQ line
+  var keep: List[Str] = []
+  var on_ = false
+  for l in GO_OPENAI_LINES {
+    if l.starts_with("  ") {
+      if on_ {
+        keep.push(l)
+      }
+      continue
+    }
+    on_ = want.contains(l)
+    if on_ {
+      keep.push(l)
+    }
+  }
+  let got = f.log.with_read(fn(l: List[Str]) -> List[Str] { l })
+  var i = 0
+  while i < keep.len() || i < got.len() {
+    let w = if i < keep.len() { keep[i] } else { "<none>" }
+    let g = if i < got.len() { got[i] } else { "<none>" }
+    expect((i, g)) == (i, w)
+    i = i + 1
+  }
+}
+
+const CHAT_RESP: Str = "{\"id\":\"chatcmpl-1\",\"object\":\"chat.completion\",\"created\":1700000000,\"model\":\"gpt-4o-2024-08-06\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"Hello.\",\"refusal\":null},\"logprobs\":null,\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":2,\"total_tokens\":11},\"system_fingerprint\":\"fp_1\"}"
+
+const TOOL_RESP: Str = "{\"id\":\"chatcmpl-2\",\"object\":\"chat.completion\",\"created\":1700000001,\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"{\\\"city\\\":\\\"Paris\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":20,\"completion_tokens\":7,\"total_tokens\":27}}"
+
+fn weather_tool() -> Tool {
+  Tool{name: "get_weather", description: "Weather for a city", parameters: Some(json.Value.Object([("type", json.Value.Str("object")), ("properties", json.Value.Object([("city", json.Value.Object([("type", json.Value.Str("string"))]))])), ("required", json.Value.List([json.Value.Str("city")]))]))}
+}
+
+test "openai-go's client, chat completions, embeddings and retries" {
+  let f = serve(os.net, "api.example.test")
+  let c = new_client(os.net, os.clock, os.rand, Options[()]{base_url: "https://api.example.test/v1/", api_key: "test-key", organization: "org-test", project: "proj-test"})
+  let user = [system_message("Be brief."), user_message("Hi")]
+  let base = ChatParams{model: "gpt-4o", messages: user}
+  let none: List[(Str, Str)] = []
+
+  start(f, "c1")
+  on(f, "POST /v1/chat/completions", [(200, none, CHAT_RESP)])
+  match c.chat_completion(ChatParams{model: "gpt-4o", messages: user, temperature: Some(0.5), max_completion_tokens: Some(10)}) {
+    Ok(r) => show(f, "chat", "id=${r.id} model=${r.model} content=${q(r.choices[0].message.content)} finish=${r.choices[0].finish_reason} usage=${r.usage.prompt_tokens}/${r.usage.completion_tokens}/${r.usage.total_tokens}")
+    Err(e) => show_err(f, "chat", e)
+  }
+
+  start(f, "c2")
+  on(f, "POST /v1/chat/completions", [(200, none, TOOL_RESP)])
+  match c.chat_completion(ChatParams{model: "gpt-4o", messages: [user_message("Weather in Paris?")], tools: [weather_tool()], tool_choice: Some(ToolChoice.Auto)}) {
+    Ok(r) => {
+      let tc = r.choices[0].message.tool_calls[0]
+      show(f, "tools", "finish=${r.choices[0].finish_reason} call=${tc.id} ${tc.name} ${tc.arguments} content=${q(r.choices[0].message.content)}")
+    }
+    Err(e) => show_err(f, "tools", e)
+  }
+
+  start(f, "e1")
+  on(f, "POST /v1/embeddings", [(200, none, "{\"object\":\"list\",\"data\":[{\"object\":\"embedding\",\"index\":0,\"embedding\":[0.25,-1.5,3]}],\"model\":\"text-embedding-3-small\",\"usage\":{\"prompt_tokens\":2,\"total_tokens\":2}}")])
+  match c.embeddings(EmbeddingParams{model: "text-embedding-3-small", input: EmbeddingInput.One("hello"), encoding_format: Some("float")}) {
+    Ok(r) => show(f, "embeddings float", "[${r.data[0].embedding.map(gofloat).join(" ")}] usage=${r.total_tokens}")
+    Err(e) => show_err(f, "embeddings float", e)
+  }
+
+  start(f, "e2")
+  on(f, "POST /v1/embeddings", [(200, none, "{\"object\":\"list\",\"data\":[{\"object\":\"embedding\",\"index\":0,\"embedding\":\"AACAPgAAwL8AAEBA\"},{\"object\":\"embedding\",\"index\":1,\"embedding\":\"AACAPw==\"}],\"model\":\"text-embedding-3-small\",\"usage\":{\"prompt_tokens\":4,\"total_tokens\":4}}")])
+  match c.embeddings(EmbeddingParams{model: "text-embedding-3-small", input: EmbeddingInput.Many(["a", "b"]), dimensions: Some(3)}) {
+    Ok(r) => show(f, "embeddings default format", "[${r.data[0].embedding.map(gofloat).join(" ")}] [${r.data[1].embedding.map(gofloat).join(" ")}]")
+    Err(e) => show_err(f, "embeddings default format", e)
+  }
+
+  start(f, "r1")
+  on(f, "POST /v1/chat/completions", [(400, none, "{\"error\":{\"message\":\"Invalid value for 'temperature'.\",\"type\":\"invalid_request_error\",\"param\":\"temperature\",\"code\":\"invalid_value\"}}")])
+  match c.chat_completion(ChatParams{model: "gpt-4o", messages: user, temperature: Some(9.0)}) {
+    Ok(_) => show(f, "400", "ok")
+    Err(e) => show_err(f, "400", e)
+  }
+
+  let ok_or = fn(label: Str, r: Result[ChatCompletion, OpenAIErr]) {
+    match r {
+      Ok(_) => show(f, label, "ok")
+      Err(e) => show_err(f, label, e)
+    }
+  }
+
+  start(f, "r2")
+  on(f, "POST /v1/chat/completions", [(429, [("retry-after-ms", "10")], "{\"error\":{\"message\":\"Rate limit\",\"type\":\"requests\",\"code\":\"rate_limit_exceeded\"}}"), (200, none, CHAT_RESP)])
+  ok_or("429 then 200", c.chat_completion(base))
+
+  start(f, "r3")
+  on(f, "POST /v1/chat/completions", [(500, [("retry-after-ms", "5")], "{\"error\":{\"message\":\"boom\",\"type\":\"server_error\"}}")])
+  ok_or("500 three times", c.chat_completion(base))
+
+  start(f, "r4")
+  on(f, "POST /v1/chat/completions", [(500, [("x-should-retry", "false")], "{\"error\":{\"message\":\"no retry\",\"type\":\"server_error\"}}")])
+  ok_or("500 x-should-retry false", c.chat_completion(base))
+
+  start(f, "r5")
+  on(f, "POST /v1/chat/completions", [(200, [("x-should-retry", "true")], CHAT_RESP)])
+  ok_or("200 with x-should-retry true", c.chat_completion(base))
+
+  start(f, "r6")
+  on(f, "POST /v1/chat/completions", [(429, [("retry-after", "600")], "{\"error\":{\"message\":\"later\",\"type\":\"requests\"}}")])
+  ok_or("429 retry-after beyond the maximum", c.chat_completion(base))
+
+  start(f, "r7")
+  on(f, "POST /v1/chat/completions", [(503, [("retry-after-ms", "5")], "not json"), (503, [("retry-after-ms", "5")], "not json")])
+  ok_or("503 not json, max retries 1", c.chat_completion(base, CallOptions{max_retries: Some(1)}))
+
+  compare(f, ["c1", "c2", "e1", "e2", "r1", "r2", "r3", "r4", "r5", "r6", "r7"])
+}

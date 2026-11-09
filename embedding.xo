@@ -1,0 +1,104 @@
+// Embeddings.
+//
+// Ported from github.com/openai/openai-go v3.98.0 (embedding.go,
+// embedding_helpers.go), Copyright 2026 OpenAI, Apache License 2.0.
+// Changed from the original: rewritten in Xo (NOTICE.md).
+
+use std/base64
+use std/json
+
+/// Go's EmbeddingNewParamsInputUnion.
+pub enum EmbeddingInput {
+  One(s: Str)
+  Many(xs: List[Str])
+  Tokens(ts: List[Int])
+  TokenLists(tss: List[List[Int]])
+}
+
+/// Go's EmbeddingNewParams.
+pub struct EmbeddingParams {
+  pub input: EmbeddingInput
+  pub model: Str
+  pub dimensions: Int? = None
+  pub user: Str? = None
+  /// `float` or `base64`; None sends none (the API's default, base64,
+  /// which is decoded as Go decodes it).
+  pub encoding_format: Str? = None
+}
+
+pub fn (p: EmbeddingParams) to_json() -> json.Value {
+  let ints = fn(xs: List[Int]) -> json.Value { json.Value.List(xs.map(fn(n: Int) -> json.Value { json.Value.Int(n) })) }
+  var f: List[(Str, json.Value)] = [("input", match p.input {
+    EmbeddingInput.One(s) => json.Value.Str(s)
+    EmbeddingInput.Many(xs) => json.Value.List(xs.map(fn(s: Str) -> json.Value { json.Value.Str(s) }))
+    EmbeddingInput.Tokens(ts) => ints(ts)
+    EmbeddingInput.TokenLists(tss) => json.Value.List(tss.map(ints))
+  }), ("model", json.Value.Str(p.model))]
+  if let Some(d) = p.dimensions {
+    f.push(("dimensions", json.Value.Int(d)))
+  }
+  if let Some(u) = p.user {
+    f.push(("user", json.Value.Str(u)))
+  }
+  if let Some(e) = p.encoding_format {
+    f.push(("encoding_format", json.Value.Str(e)))
+  }
+  json.Value.Object(f)
+}
+
+pub struct Embedding {
+  pub index: Int = 0
+  pub embedding: List[Float] = []
+}
+
+/// Go's CreateEmbeddingResponse.
+pub struct EmbeddingResponse {
+  pub data: List[Embedding] = []
+  pub model: Str = ""
+  pub prompt_tokens: Int = 0
+  pub total_tokens: Int = 0
+  pub raw: json.Value = json.Value.Null
+}
+
+/// Go's unmarshalEmbedding: a list of numbers, or a base64 string of
+/// little-endian float32s (left as nothing when its length is not a
+/// multiple of 4 or it is not base64, as Go leaves it).
+fn vector_of(v: json.Value) -> List[Float] {
+  match v {
+    json.Value.List(xs) => xs.map(fn(x: json.Value) -> Float {
+      match x {
+        json.Value.Num(f) => f
+        json.Value.Int(n) => Float(n)
+        _ => 0.0
+      }
+    })
+    json.Value.Str(s) => {
+      let b = base64.decode(s, base64.Base64.Std).ok() ?? return []
+      if b.len() % 4 != 0 {
+        return []
+      }
+      var out: List[Float] = []
+      var i = 0
+      while i < b.len() {
+        let bits = Int(b[i]) | (Int(b[i + 1]) << 8) | (Int(b[i + 2]) << 16) | (Int(b[i + 3]) << 24)
+        out.push(Float(Float32.from_bits(UInt32(bits))))
+        i = i + 4
+      }
+      out
+    }
+    _ => []
+  }
+}
+
+/// Go's Embeddings.New: POST embeddings.
+pub fn (c: Client[fx]) embeddings(p: EmbeddingParams, co: CallOptions = CallOptions{}) -> EmbeddingResponse ! OpenAIErr uses (net.dial, clock, rand, fx) {
+  let v = c.call_json("POST", "embeddings", Some(p.to_json()), co)?
+  let u = v.get("usage") ?? json.Value.Null
+  Ok(EmbeddingResponse{
+    data: list_of(v, "data").map(fn(e: json.Value) -> Embedding { Embedding{index: int_of(e, "index"), embedding: vector_of(e.get("embedding") ?? json.Value.Null)} }),
+    model: str_of(v, "model"),
+    prompt_tokens: int_of(u, "prompt_tokens"),
+    total_tokens: int_of(u, "total_tokens"),
+    raw: v,
+  })
+}
