@@ -1,0 +1,204 @@
+// Replays the Go program's Azure calls (z1 to z5, vectors_test.xo)
+// against the same fake: a loopback http host, a credential that counts
+// its tokens.
+
+use std/http
+use std/json
+use std/testing
+use github.com/xo-lang/openai
+use github.com/xo-lang/azure/azcore
+
+fn os_tag() -> Str {
+  os_name()
+}
+
+struct Fake {
+  section: Mutex[Str]
+  log: Mutex[List[Str]]
+  q: Mutex[Map[Str, List[(Int, List[(Str, Str)], Str)]]]
+}
+
+fn note(f: Fake, s: Str) {
+  f.log.with(fn(var l: List[Str]) { l.push(s) })
+}
+
+fn sec(f: Fake) -> Str {
+  f.section.with_read(fn(s: Str) -> Str { s })
+}
+
+const MASKED: List[Str] = ["x-stainless-os", "x-stainless-arch", "x-stainless-runtime-version"]
+
+fn answer(f: Fake, req: http.Request) -> http.Response {
+  var hs: List[Str] = []
+  for (k, v) in req.headers {
+    let lk = k.to_lower()
+    if lk == "accept-encoding" || lk == "content-length" || lk == "host" {
+      continue
+    }
+    let shown = if lk == "user-agent" { v.replace("(xo; ${os_tag()})", "(xo; <os>)") } else { v }
+    hs.push("${lk}=${if MASKED.contains(lk) { "<${lk}>" } else { shown }}")
+  }
+  let qs = req.raw_query()
+  note(f, "${sec(f)}: REQ ${req.method} ${req.escaped_path()}${if qs == "" { "" } else { "?${qs}" }}")
+  note(f, "  H ${hs.sort().join(" | ")}")
+  note(f, "  B ${req.body.to_str_lossy()}")
+  let key = "${req.method} ${req.url.path}"
+  let r = f.q.with(fn(var m: Map[Str, List[(Int, List[(Str, Str)], Str)]]) -> (Int, List[(Str, Str)], Str)? {
+    let rs = m.get(key) ?? return None
+    if rs.is_empty() {
+      return None
+    }
+    if rs.len() > 1 {
+      m[key] = rs[1..rs.len()]
+    }
+    Some(rs[0])
+  })
+  match r {
+    Some((st, hdrs, b)) => {
+      var resp = http.text(st, b)
+      var ct = "application/json"
+      for (k, v) in hdrs {
+        if k.to_lower() == "content-type" {
+          ct = v
+        } else {
+          resp.headers[k] = v
+        }
+      }
+      resp.headers["Content-Type"] = ct
+      resp
+    }
+    None => {
+      note(f, "${sec(f)}: NO REPLY for ${key}")
+      http.text(404, "{\"error\":{\"message\":\"no reply\",\"type\":\"fake\"}}")
+    }
+  }
+}
+
+fn serve(net: testing.FakeNet, host: Str) -> Fake {
+  let f = Fake{section: Mutex[Str].new(""), log: Mutex[List[Str]].new([]), q: Mutex[Map[Str, List[(Int, List[(Str, Str)], Str)]]].new({})}
+  let h = fn(req: http.Request) -> http.Response { answer(f, req) }
+  net.handle("POST ${host}/{rest...}", h)
+  net.handle("GET ${host}/{rest...}", h)
+  f
+}
+
+fn start(f: Fake, section: Str) {
+  f.section.with(fn(var s: Str) { s = section })
+  f.q.with(fn(var m: Map[Str, List[(Int, List[(Str, Str)], Str)]]) { m = {} })
+}
+
+fn on(f: Fake, key: Str, rs: List[(Int, List[(Str, Str)], Str)]) {
+  f.q.with(fn(var m: Map[Str, List[(Int, List[(Str, Str)], Str)]]) { m[key] = rs })
+}
+
+fn q(s: Str) -> Str {
+  json.encode_str(s)
+}
+
+/// Go's `%v` of a float64: the shortest text that round trips.
+fn gofloat(x: Float) -> Str {
+  x.to_general(-1)
+}
+
+fn show_err(f: Fake, label: Str, e: openai.OpenAIErr) {
+  match e {
+    openai.OpenAIErr.Api(status, code, kind, param, message, _) => note(f, "${sec(f)}: ${label}: error: ${e.display()} | status=${status} code=${q(code)} type=${q(kind)} param=${q(param)} message=${q(message)}")
+    openai.OpenAIErr.Transport(_) | openai.OpenAIErr.Request(_) | openai.OpenAIErr.Decode(_) | openai.OpenAIErr.Stream(_) => note(f, "${sec(f)}: ${label}: error: ${e.display()}")
+  }
+}
+
+fn show(f: Fake, label: Str, v: Str) {
+  note(f, "${sec(f)}: ${label}: ${v}")
+}
+
+/// The Go program's sections that this file replays, compared line by
+/// line in order.
+fn compare(f: Fake, sections: List[Str]) {
+  let want = GO_OPENAI_LINES.filter(fn(l: Str) -> Bool {
+    for s in sections {
+      if l.starts_with("${s}: ") {
+        return true
+      }
+    }
+    false
+  })
+  // a section's H and B lines follow its REQ line
+  var keep: List[Str] = []
+  var on_ = false
+  for l in GO_OPENAI_LINES {
+    if l.starts_with("  ") {
+      if on_ {
+        keep.push(l)
+      }
+      continue
+    }
+    on_ = want.contains(l)
+    if on_ {
+      keep.push(l)
+    }
+  }
+  let got = f.log.with_read(fn(l: List[Str]) -> List[Str] { l })
+  var i = 0
+  while i < keep.len() || i < got.len() {
+    let w = if i < keep.len() { keep[i] } else { "<none>" }
+    let g = if i < got.len() { got[i] } else { "<none>" }
+    expect((i, g)) == (i, w)
+    i = i + 1
+  }
+}
+
+const CHAT_RESP: Str = "{\"id\":\"chatcmpl-1\",\"object\":\"chat.completion\",\"created\":1700000000,\"model\":\"gpt-4o-2024-08-06\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"Hello.\",\"refusal\":null},\"logprobs\":null,\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":2,\"total_tokens\":11},\"system_fingerprint\":\"fp_1\"}"
+
+/// Go's fakeCred: tok-1, tok-2, ... and a CRED line per call.
+struct FakeCred {
+  f: Fake
+  n: Mutex[Int]
+}
+
+fn (c: FakeCred) get_token(opts: azcore.TokenRequestOptions) -> azcore.AccessToken ! azcore.AuthErr uses (net.dial, clock, rand) {
+  let n = c.n.with(fn(var n: Int) -> Int {
+    n = n + 1
+    n
+  })
+  note(c.f, "  CRED scopes=[${opts.scopes.join(" ")}]")
+  Ok(azcore.AccessToken{token: Secret.new("tok-${n}"), expires_on: Time.from_unix_millis(4102444800000)})
+}
+
+test "openai-go's azure package: endpoint, api key, token credential, plain http" {
+  let f = serve(os.net, "http://localhost")
+  let user = [openai.system_message("Be brief."), openai.user_message("Hi")]
+  let base = openai.ChatParams{model: "gpt-4o", messages: user}
+  let none: List[(Str, Str)] = []
+  let ok = fn(label: Str, r: Result[(), openai.OpenAIErr]) {
+    match r {
+      Ok(_) => show(f, label, "ok")
+      Err(e) => show_err(f, label, e)
+    }
+  }
+  let az = openai.new_client(os.net, os.clock, os.rand, options(AzureOptions[()]{endpoint: "http://localhost", api_version: "2024-10-21", api_key: "az-key", unsafe_allow_http: true}))
+
+  start(f, "z1")
+  on(f, "POST /openai/deployments/gpt-4o/chat/completions", [(200, none, CHAT_RESP)])
+  ok("azure api key chat", az.chat_completion(base).map(fn(_: openai.ChatCompletion) {}))
+
+  start(f, "z2")
+  on(f, "POST /openai/deployments/text-embedding-3-small/embeddings", [(200, none, "{\"object\":\"list\",\"data\":[{\"object\":\"embedding\",\"index\":0,\"embedding\":\"AACAPw==\"}],\"model\":\"text-embedding-3-small\",\"usage\":{\"prompt_tokens\":1,\"total_tokens\":1}}")])
+  ok("azure api key embeddings", az.embeddings(openai.EmbeddingParams{model: "text-embedding-3-small", input: openai.EmbeddingInput.One("x")}).map(fn(_: openai.EmbeddingResponse) {}))
+
+  start(f, "z3")
+  on(f, "POST /openai/deployments/gpt-4o/chat/completions", [(200, none, CHAT_RESP)])
+  let cred = FakeCred{f: f, n: Mutex.new(0)}
+  let azt = openai.new_client(os.net, os.clock, os.rand, options(AzureOptions[()]{endpoint: "http://localhost/", api_version: "2024-10-21", credential: Some(cred), unsafe_allow_http: true}))
+  ok("azure token credential", azt.chat_completion(base).map(fn(_: openai.ChatCompletion) {}))
+  ok("azure token credential, second call", azt.chat_completion(base).map(fn(_: openai.ChatCompletion) {}))
+
+  start(f, "z5")
+  on(f, "POST /openai/deployments/gpt-4o/chat/completions", [(429, [("retry-after-ms", "5")], "{\"error\":{\"message\":\"slow down\",\"type\":\"requests\"}}"), (200, none, CHAT_RESP)])
+  ok("azure token credential, 429 then 200", azt.chat_completion(base).map(fn(_: openai.ChatCompletion) {}))
+
+  start(f, "z4")
+  let azh = openai.new_client(os.net, os.clock, os.rand, options(AzureOptions[()]{endpoint: "http://localhost", api_version: "2024-10-21", api_key: "az-key"}))
+  ok("azure http without unsafe", azh.chat_completion(base).map(fn(_: openai.ChatCompletion) {}))
+
+  compare(f, ["z1", "z2", "z3", "z5", "z4"])
+}

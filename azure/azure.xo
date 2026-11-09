@@ -1,0 +1,133 @@
+// Azure OpenAI: the client options that point the OpenAI client at an
+// Azure OpenAI resource and authenticate it.
+//
+// Ported from github.com/openai/openai-go v3.98.0 (azure/azure.go),
+// Copyright 2026 OpenAI, Apache License 2.0. Changed from the original:
+// rewritten in Xo; Go's four options are one AzureOptions value turned
+// into the client's Options; the token path names itself as Xo
+// (NOTICE.md).
+
+use std/http
+use std/json
+use std/url
+use github.com/xo-lang/openai
+use github.com/xo-lang/azure/azcore
+
+/// The scope a TokenCredential is asked for (Go's default).
+pub const DEFAULT_SCOPE: Str = "https://cognitiveservices.azure.com/.default"
+
+/// The token path's User-Agent prefix (Go's azcore pipeline names
+/// `azsdk-go-azopenai-extensions/v.0.1.0 (<go version>; <os>)`).
+pub const TOKEN_USER_AGENT: Str = "xo-lang-openai-azure/v0.1.0"
+
+/// Routes whose JSON body names the deployment in `model` (Go's
+/// jsonRoutes).
+const JSON_ROUTES: List[Str] = ["/completions", "/chat/completions", "/embeddings", "/audio/speech", "/images/generations"]
+
+/// Go's azure.WithEndpoint, WithAPIKey, WithTokenCredential (with
+/// WithTokenCredentialScopes) and WithUnsafeAllowHTTP as one value.
+pub struct AzureOptions[fx: Effects] {
+  /// The resource's endpoint, such as `https://<resource>.openai.azure.com`.
+  pub endpoint: Str
+  /// The `api-version` query value; empty fails every call, as Go's.
+  pub api_version: Str
+  /// Sent as `Api-Key` (Go's azure.WithAPIKey).
+  pub api_key: Str = ""
+  /// Asked for a bearer token once per call (Go's
+  /// azure.WithTokenCredential).
+  pub credential: azcore.TokenCredential[fx]? = None
+  pub scopes: List[Str] = [DEFAULT_SCOPE]
+  /// Lets credentials go over plain http to a loopback host (Go's
+  /// WithUnsafeAllowHTTP, for local development only).
+  pub unsafe_allow_http: Bool = false
+}
+
+fn https_err() -> Str {
+  "azure: authenticated requests require HTTPS; WithUnsafeAllowHTTP permits HTTP only for local development on loopback endpoints"
+}
+
+/// Go's azureCredentialHTTPAllowed: localhost or a loopback IP.
+fn loopback(host: Str) -> Bool {
+  host == "localhost" || host.starts_with("127.") || host == "::1" || host == "[::1]"
+}
+
+/// The client options for an Azure OpenAI resource, over `o` (whose own
+/// api_key must stay empty, as Go requires).
+pub fn options[fx: Effects](a: AzureOptions[fx], o: openai.Options[fx] = openai.Options{}) -> openai.Options[fx] {
+  var r = o
+  let base = if a.endpoint.ends_with("/") { a.endpoint } else { "${a.endpoint}/" }
+  r.base_url = base
+  let prefix = (http.parse_url(base).ok() ?? http.Url{scheme: "", host: "", port: None, path: "", query: {}}).path.trim_suffix("/")
+  let key_set = o.api_key != ""
+  let hook = fn(req: http.Request) -> http.Request ! Str uses net.dial, clock, rand, fx {
+    if a.api_version == "" {
+      return Err("apiVersion is an empty string, but needs to be set. See https://learn.microsoft.com/en-us/azure/ai-services/openai/reference#rest-api-versioning for details.")
+    }
+    if key_set {
+      return Err("azure: Azure authentication cannot be combined with option.WithAPIKey or option.WithAdminAPIKey")
+    }
+    let token_auth = a.credential != None
+    if a.api_key == "" && !token_auth {
+      return Err("azure: authentication is required; configure exactly one of azure.WithAPIKey or azure.WithTokenCredential")
+    }
+    if a.api_key != "" && token_auth {
+      return Err("azure: authentication is required; configure exactly one of azure.WithAPIKey or azure.WithTokenCredential")
+    }
+    if (req.header("Authorization") ?? "") != "" {
+      return Err("azure: Azure authentication cannot be combined with a custom Authorization header")
+    }
+    if req.url.scheme.to_lower() == "http" && !(a.unsafe_allow_http && loopback(req.url.host)) {
+      return Err(https_err())
+    }
+    // the deployment path: /openai/deployments/<model>/<route> for a
+    // JSON route, else /openai/<route>
+    var path = req.escaped_path()
+    var keep = ""
+    if path.starts_with("${prefix}/") {
+      keep = prefix
+      path = path[prefix.len()..path.len()]
+    }
+    let plain = url.path_unescape(path) ?? _ => path
+    var rewritten = "/openai${path}"
+    if JSON_ROUTES.contains(plain) {
+      let v = json.parse_value(req.body.to_str_lossy()) ?? e => return Err("azure: could not parse JSON request body for deployment routing: ${e.display()}")
+      let model = match v.get("model") {
+        Some(json.Value.Str(m)) => m
+        _ => ""
+      }
+      if model == "" {
+        return Err("azure: deployment routing requires a non-empty model field")
+      }
+      rewritten = "/openai/deployments/${url.path_escape(model)}${path}"
+    }
+    let q = req.raw_query()
+    let av = "api-version=${url.query_escape(a.api_version)}"
+    let port = match req.url.port {
+      Some(p) => ":${p}"
+      None => ""
+    }
+    var hs = req.headers
+    var target = "${req.url.scheme}://${req.url.host}${port}${keep}${rewritten}?${if q == "" { av } else { "${q}&${av}" }}"
+    if a.api_key != "" {
+      hs["Api-Key"] = a.api_key
+    }
+    if let Some(cred) = a.credential {
+      let t = cred.get_token(azcore.TokenRequestOptions{scopes: a.scopes}) ?? e => return Err(e.display())
+      hs["Authorization"] = "Bearer ${t.token.reveal()}"
+      let ua = hs.get("User-Agent") ?? ""
+      hs["User-Agent"] = "${TOKEN_USER_AGENT} (xo; ${os_name()}) ${ua}".trim_suffix(" ")
+    }
+    Ok(http.new_request(req.method, target, headers: hs, body: req.body))
+  }
+  r.hooks = r.hooks + [hook]
+  r
+}
+
+fn os_name() -> Str {
+  match target.os {
+    Linux => "linux"
+    Darwin => "darwin"
+    Windows => "windows"
+    Wasi => "wasi"
+  }
+}

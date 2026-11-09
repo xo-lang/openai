@@ -4,8 +4,8 @@
 set -eu
 cd "$(dirname "$0")/.."
 xo=${XO_CLI:-xo}
-"$xo" fmt --check .
-"$xo" check .
-"$xo" test .
+for m in . azure; do
+  (cd "$m" && "$xo" fmt --check . && "$xo" check . && "$xo" test .)
+done
 sh scripts/check-public.sh
 echo "gate: ok"
