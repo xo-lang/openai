@@ -172,6 +172,89 @@ test "openai-go's client, chat completions, embeddings and retries" {
     Err(e) => show_err(f, "tools", e)
   }
 
+  start(f, "c3")
+  let sse = fn(events: List[Str]) -> (Int, List[(Str, Str)], Str) {
+    (200, [("content-type", "text/event-stream")], events.map(fn(e: Str) -> Str { "data: ${e}\n\n" }).join(""))
+  }
+  let chunk = fn(delta: Str, finish: Str) -> Str {
+    let fr = if finish == "" { "null" } else { "\"${finish}\"" }
+    "{\"id\":\"chatcmpl-s\",\"object\":\"chat.completion.chunk\",\"created\":1700000002,\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":${delta},\"finish_reason\":${fr}}]}"
+  }
+  on(f, "POST /v1/chat/completions", [sse([
+    chunk("{\"role\":\"assistant\",\"content\":\"\"}", ""),
+    chunk("{\"content\":\"Hel\"}", ""),
+    chunk("{\"content\":\"lo.\"}", ""),
+    chunk("{}", "stop"),
+    "{\"id\":\"chatcmpl-s\",\"object\":\"chat.completion.chunk\",\"created\":1700000002,\"model\":\"gpt-4o\",\"choices\":[],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":2,\"total_tokens\":11}}",
+    "[DONE]",
+  ])])
+  let drain = fn(label: Str, st: ChatStream, log_chunks: Bool, log_tools: Bool) -> (Int, Accumulator, OpenAIErr?) {
+    var acc = Accumulator{}
+    var n = 0
+    while {
+      match st.next() {
+        Ok(Some(ch)) => {
+          acc.add(ch)
+          n = n + 1
+          if log_chunks {
+            let d = if ch.choices.is_empty() { "" } else { ch.choices[0].delta.content ?? "" }
+            note(f, "${sec(f)}: CHUNK ${n} delta=${q(d)}")
+          }
+          if log_tools {
+            if let Some(tc) = acc.just_finished_tool_call() {
+              note(f, "${sec(f)}: FINISHED tool ${tc.index} ${tc.name} ${tc.arguments}")
+            }
+          }
+        }
+        Ok(None) => return (n, acc, None)
+        Err(e) => return (n, acc, Some(e))
+      }
+    }
+  }
+  match c.chat_completion_stream(ChatParams{model: "gpt-4o", messages: user, include_usage: Some(true)}) {
+    Ok(st) => {
+      let (n, acc, e) = drain("c3", st, true, false)
+      match e {
+        Some(err) => show_err(f, "stream end", err)
+        None => show(f, "stream end", "chunks=${n} content=${q(acc.completion.choices[0].message.content)} finish=${acc.completion.choices[0].finish_reason} usage=${acc.completion.usage.total_tokens}")
+      }
+    }
+    Err(e) => show_err(f, "stream end", e)
+  }
+
+  start(f, "c4")
+  on(f, "POST /v1/chat/completions", [sse([
+    chunk("{\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"id\":\"call_9\",\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"\"}}]}", ""),
+    chunk("{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"city\\\":\"}}]}", ""),
+    chunk("{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"Oslo\\\"}\"}}]}", ""),
+    chunk("{}", "tool_calls"),
+    "[DONE]",
+  ])])
+  match c.chat_completion_stream(ChatParams{model: "gpt-4o", messages: user, tools: [weather_tool()]}) {
+    Ok(st) => {
+      let (_, acc, e) = drain("c4", st, false, true)
+      let tcs = acc.completion.choices[0].message.tool_calls
+      match e {
+        Some(err) => show_err(f, "stream tools end", err)
+        None => show(f, "stream tools end", "calls=${tcs.len()} ${tcs[0].id} ${tcs[0].name} ${tcs[0].arguments} finish=${acc.completion.choices[0].finish_reason}")
+      }
+    }
+    Err(e) => show_err(f, "stream tools end", e)
+  }
+
+  start(f, "c5")
+  on(f, "POST /v1/chat/completions", [(200, [("content-type", "text/event-stream")], "data: ${chunk("{\"content\":\"x\"}", "")}\n\nevent: error\ndata: {\"error\":{\"message\":\"overloaded\",\"type\":\"server_error\"}}\n\n")])
+  match c.chat_completion_stream(ChatParams{model: "gpt-4o", messages: user}) {
+    Ok(st) => {
+      let (n, _, e) = drain("c5", st, false, false)
+      match e {
+        Some(err) => show_err(f, "stream error event", err)
+        None => show(f, "stream error event", "chunks=${n}")
+      }
+    }
+    Err(e) => show_err(f, "stream error event", e)
+  }
+
   start(f, "e1")
   on(f, "POST /v1/embeddings", [(200, none, "{\"object\":\"list\",\"data\":[{\"object\":\"embedding\",\"index\":0,\"embedding\":[0.25,-1.5,3]}],\"model\":\"text-embedding-3-small\",\"usage\":{\"prompt_tokens\":2,\"total_tokens\":2}}")])
   match c.embeddings(EmbeddingParams{model: "text-embedding-3-small", input: EmbeddingInput.One("hello"), encoding_format: Some("float")}) {
@@ -224,5 +307,5 @@ test "openai-go's client, chat completions, embeddings and retries" {
   on(f, "POST /v1/chat/completions", [(503, [("retry-after-ms", "5")], "not json"), (503, [("retry-after-ms", "5")], "not json")])
   ok_or("503 not json, max retries 1", c.chat_completion(base, CallOptions{max_retries: Some(1)}))
 
-  compare(f, ["c1", "c2", "e1", "e2", "r1", "r2", "r3", "r4", "r5", "r6", "r7"])
+  compare(f, ["c1", "c2", "c3", "c4", "c5", "e1", "e2", "r1", "r2", "r3", "r4", "r5", "r6", "r7"])
 }

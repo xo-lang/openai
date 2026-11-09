@@ -67,6 +67,17 @@ repo is MIT, so the port gets its own repository.
    error; Xo replays the same calls against the same fake. Never a
    real OpenAI or Azure endpoint, and no real key.
 
+## Amendment 1 (2026-11-09): streaming has its own reader
+
+Point 5 is settled the other way: the root module reads server-sent
+events itself (`stream.xo`, a port of openai-go's `packages/ssestream`),
+so it does not require the azure repository; only the `azure` package
+does. openai-go's rules differ from azcore's reader in what matters
+here: any event whose JSON has an `error` field ends the stream with
+`received error while streaming`, `[DONE]` is matched as a prefix of
+the data, an event not ended by a blank line is dropped, and a line may
+be 32 MiB.
+
 ## Deferred
 
 The Responses API (41k Go lines), assistants, threads and the other

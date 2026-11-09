@@ -1,0 +1,358 @@
+// Streamed chat completions: the server-sent events reader, the chunks,
+// and the accumulator.
+//
+// Ported from github.com/openai/openai-go v3.98.0 (packages/ssestream,
+// chatcompletion.go's ChatCompletionChunk, streamaccumulator.go),
+// Copyright 2026 OpenAI, Apache License 2.0. Changed from the original:
+// rewritten in Xo; a pull reader in place of Go's iterator; the
+// accumulator without logprobs (NOTICE.md).
+
+use std/http
+use std/json
+
+/// Go's scanner limit for one line (bufio.MaxScanTokenSize << 9, 32 MiB).
+const MAX_LINE: Int = 33554432
+
+/// A tool call's piece in a chunk (Go's ChatCompletionChunkChoiceDeltaToolCall).
+pub struct ToolCallDelta {
+  pub index: Int = 0
+  pub id: Str = ""
+  pub kind: Str = ""
+  pub name: Str = ""
+  pub arguments: Str = ""
+}
+
+/// Go's ChatCompletionChunkChoiceDelta; content and refusal are None when
+/// absent or null (Go's `JSON.Content.Valid()`).
+pub struct Delta {
+  pub role: Str = ""
+  pub content: Str? = None
+  pub refusal: Str? = None
+  pub tool_calls: List[ToolCallDelta] = []
+}
+
+pub struct ChunkChoice {
+  pub index: Int = 0
+  pub finish_reason: Str = ""
+  pub delta: Delta = Delta{}
+}
+
+/// Go's ChatCompletionChunk; `raw` is the event's JSON.
+pub struct ChatChunk {
+  pub id: Str = ""
+  pub object: Str = ""
+  pub created: Int = 0
+  pub model: Str = ""
+  pub service_tier: Str = ""
+  pub system_fingerprint: Str = ""
+  pub choices: List[ChunkChoice] = []
+  pub usage: Usage = Usage{}
+  pub raw: json.Value = json.Value.Null
+}
+
+fn opt_str_of(v: json.Value, k: Str) -> Str? {
+  match v.get(k) {
+    Some(json.Value.Str(s)) => Some(s)
+    _ => None
+  }
+}
+
+fn chunk_of(v: json.Value) -> ChatChunk {
+  ChatChunk{
+    id: str_of(v, "id"),
+    object: str_of(v, "object"),
+    created: int_of(v, "created"),
+    model: str_of(v, "model"),
+    service_tier: str_of(v, "service_tier"),
+    system_fingerprint: str_of(v, "system_fingerprint"),
+    choices: list_of(v, "choices").map(fn(c: json.Value) -> ChunkChoice {
+      let d = c.get("delta") ?? json.Value.Null
+      ChunkChoice{
+        index: int_of(c, "index"),
+        finish_reason: str_of(c, "finish_reason"),
+        delta: Delta{
+          role: str_of(d, "role"),
+          content: opt_str_of(d, "content"),
+          refusal: opt_str_of(d, "refusal"),
+          tool_calls: list_of(d, "tool_calls").map(fn(t: json.Value) -> ToolCallDelta {
+            let f = t.get("function") ?? json.Value.Null
+            ToolCallDelta{index: int_of(t, "index"), id: str_of(t, "id"), kind: str_of(t, "type"), name: str_of(f, "name"), arguments: str_of(f, "arguments")}
+          }),
+        },
+      }
+    }),
+    usage: usage_of(v),
+    raw: v,
+  }
+}
+
+/// A streamed chat completion (Go's ssestream.Stream[ChatCompletionChunk]):
+/// `next` gives each chunk, None at the end.
+pub struct ChatStream {
+  s: http.ClientStream
+  buf: Mutex[Str]
+  done: Mutex[Bool]
+}
+
+/// The next line of the body without its `\n` (and a `\r` before it), as
+/// Go's bufio.ScanLines; None at the end (a last line without `\n`
+/// included).
+fn (st: ChatStream) line() -> Str? ! OpenAIErr uses net.dial {
+  while {
+    let b = st.buf.with_read(fn(s: Str) -> Str { s })
+    if let Some(i) = b.find("\n") {
+      st.buf.reset(b[i + 1..b.len()])
+      let l = b[0..i]
+      return Ok(Some(if l.ends_with("\r") { l[0..l.len() - 1] } else { l }))
+    }
+    if b.len() > MAX_LINE {
+      return Err(OpenAIErr.Decode("bufio.Scanner: token too long"))
+    }
+    match st.s.read() {
+      Ok(Some(more)) => st.buf.reset(b + more.to_str_lossy())
+      Ok(None) => {
+        st.buf.reset("")
+        if b == "" {
+          return Ok(None)
+        }
+        return Ok(Some(if b.ends_with("\r") { b[0..b.len() - 1] } else { b }))
+      }
+      Err(e) => return Err(OpenAIErr.Transport(e.display()))
+    }
+  }
+}
+
+/// Go's eventStreamDecoder.Next: the next event's data (each data line
+/// and a `\n`), None at the end (an event not ended by a blank line is
+/// dropped, as Go drops it).
+fn (st: ChatStream) event() -> Str? ! OpenAIErr uses net.dial {
+  var data = ""
+  while {
+    let l = st.line()? ?? return Ok(None)
+    if l == "" {
+      if data == "" {
+        continue
+      }
+      return Ok(Some(data))
+    }
+    let (name, value0) = l.cut(":") ?? (l, "")
+    let value = if value0.starts_with(" ") { value0[1..value0.len()] } else { value0 }
+    if name == "data" {
+      data = data + value + "\n"
+    }
+  }
+}
+
+/// The next chunk; None at `[DONE]` or the end. An event whose JSON has
+/// an `error` field ends the stream with Stream.
+pub fn (st: ChatStream) next() -> ChatChunk? ! OpenAIErr uses net.dial {
+  if st.done.with_read(fn(d: Bool) -> Bool { d }) {
+    return Ok(None)
+  }
+  let finish = fn() {
+    st.done.reset(true)
+    st.s.close()
+  }
+  let data = match st.event() {
+    Ok(Some(d)) => d
+    Ok(None) => {
+      finish()
+      return Ok(None)
+    }
+    Err(e) => {
+      finish()
+      return Err(e)
+    }
+  }
+  if data.starts_with("[DONE]") {
+    finish()
+    return Ok(None)
+  }
+  let v = json.parse_value(data) ?? e => {
+    finish()
+    return Err(OpenAIErr.Decode(e.display()))
+  }
+  if let Some(err) = v.get("error") {
+    finish()
+    return Err(OpenAIErr.Stream(match err {
+      json.Value.Str(s) => s
+      other => other.encode()
+    }))
+  }
+  Ok(Some(chunk_of(v)))
+}
+
+/// Releases the stream; reading after does nothing.
+pub fn (st: ChatStream) close() {
+  st.done.reset(true)
+  st.s.close()
+}
+
+/// A call whose response body is a stream: the tries as `execute`, the
+/// body left open on success.
+fn (c: Client[fx]) open(method: Str, path: Str, body: json.Value?, co: CallOptions) -> http.ClientStream ! OpenAIErr uses (net.dial, clock, rand, fx) {
+  var req = c.build(method, path, body, co)
+  for h in c.o.hooks {
+    req = h(req) ?? e => return Err(OpenAIErr.Request(e))
+  }
+  let max = co.max_retries ?? c.o.max_retries
+  var n = 0
+  while {
+    match c.http.open(req.with_header("X-Stainless-Retry-Count", "${n}")) {
+      Ok(s) => {
+        let head = s.head()
+        let resp = http.Response{status: head.status, headers: head.headers, body: b""}
+        if n < max && should_retry(resp) {
+          if let Some(d) = c.retry_delay(Some(resp), n) {
+            s.close()
+            c.clock.sleep(d)
+            n = n + 1
+            continue
+          }
+        }
+        if head.status >= 400 {
+          let b = s.read_all() ?? _ => b""
+          s.close()
+          return Err(api_err(http.Response{status: head.status, headers: head.headers, body: b}))
+        }
+        return Ok(s)
+      }
+      Err(e) => {
+        if n < max {
+          if let Some(d) = c.retry_delay(None, n) {
+            c.clock.sleep(d)
+            n = n + 1
+            continue
+          }
+        }
+        return Err(OpenAIErr.Transport(e.display()))
+      }
+    }
+  }
+}
+
+/// Go's Chat.Completions.NewStreaming: the body with `"stream": true`.
+pub fn (c: Client[fx]) chat_completion_stream(p: ChatParams, co: CallOptions = CallOptions{}) -> ChatStream ! OpenAIErr uses (net.dial, clock, rand, fx) {
+  let s = c.open("POST", "chat/completions", Some(p.to_json(stream: true)), co)?
+  Ok(ChatStream{s: s, buf: Mutex.new(""), done: Mutex.new(false)})
+}
+
+/// A tool call that just finished (Go's FinishedChatCompletionToolCall).
+pub struct FinishedToolCall {
+  pub index: Int
+  pub id: Str
+  pub name: Str
+  pub arguments: Str
+}
+
+/// What the first choice of the last chunk finished (Go's
+/// chatCompletionResponseState).
+enum Phase {
+  Empty
+  Content
+  Refusal
+  ToolCall(index: Int)
+  Finished
+}
+
+/// Go's ChatCompletionAccumulator: the chunks so far as one completion,
+/// and what the last chunk finished.
+pub struct Accumulator {
+  pub completion: ChatCompletion = ChatCompletion{}
+  phase: Phase = Phase.Empty
+  just: Phase = Phase.Empty
+}
+
+fn phase_of(c: ChunkChoice) -> Phase {
+  let d = c.delta
+  if !d.tool_calls.is_empty() && (d.content ?? "") == "" {
+    return Phase.ToolCall(d.tool_calls[0].index)
+  }
+  if d.content != None {
+    return Phase.Content
+  }
+  if d.refusal != None {
+    return Phase.Refusal
+  }
+  Phase.Finished
+}
+
+/// Go's AddChunk: the chunk added; true (Go's false is for chunks over
+/// its index limits, which this port does not check).
+pub fn (var a: Accumulator) add(ch: ChatChunk) -> Bool {
+  a.just = Phase.Empty
+  var cc = a.completion
+  if cc.id == "" {
+    cc.id = ch.id
+  }
+  for d in ch.choices {
+    while cc.choices.len() <= d.index {
+      cc.choices.push(Choice{index: cc.choices.len()})
+    }
+    var choice = cc.choices[d.index]
+    choice.index = d.index
+    choice.finish_reason = d.finish_reason
+    if d.delta.role != "" {
+      choice.message.role = d.delta.role
+    }
+    choice.message.content = choice.message.content + (d.delta.content ?? "")
+    choice.message.refusal = choice.message.refusal + (d.delta.refusal ?? "")
+    for t in d.delta.tool_calls {
+      while choice.message.tool_calls.len() <= t.index {
+        choice.message.tool_calls.push(ToolCall{id: "", name: "", arguments: ""})
+      }
+      var tc = choice.message.tool_calls[t.index]
+      if t.id != "" {
+        tc.id = t.id
+      }
+      tc.name = tc.name + t.name
+      tc.arguments = tc.arguments + t.arguments
+      choice.message.tool_calls[t.index] = tc
+    }
+    cc.choices[d.index] = choice
+  }
+  cc.usage = Usage{prompt_tokens: cc.usage.prompt_tokens + ch.usage.prompt_tokens, completion_tokens: cc.usage.completion_tokens + ch.usage.completion_tokens, total_tokens: cc.usage.total_tokens + ch.usage.total_tokens}
+  cc.model = ch.model
+  cc.created = ch.created
+  cc.system_fingerprint = ch.system_fingerprint
+  cc.service_tier = ch.service_tier
+  if ch.object == "chat.completion.chunk" {
+    cc.object = "chat.completion"
+  }
+  a.completion = cc
+  if !ch.choices.is_empty() {
+    let next = phase_of(ch.choices[0])
+    if next != a.phase {
+      a.just = a.phase
+    }
+    a.phase = next
+  }
+  true
+}
+
+/// Go's JustFinishedContent.
+pub fn (a: Accumulator) just_finished_content() -> Str? {
+  match a.just {
+    Phase.Content => Some(a.completion.choices[0].message.content)
+    Phase.Empty | Phase.Refusal | Phase.ToolCall(_) | Phase.Finished => None
+  }
+}
+
+/// Go's JustFinishedRefusal.
+pub fn (a: Accumulator) just_finished_refusal() -> Str? {
+  match a.just {
+    Phase.Refusal => Some(a.completion.choices[0].message.refusal)
+    Phase.Empty | Phase.Content | Phase.ToolCall(_) | Phase.Finished => None
+  }
+}
+
+/// Go's JustFinishedToolCall.
+pub fn (a: Accumulator) just_finished_tool_call() -> FinishedToolCall? {
+  match a.just {
+    Phase.ToolCall(i) => {
+      let tc = a.completion.choices[0].message.tool_calls[i]
+      Some(FinishedToolCall{index: i, id: tc.id, name: tc.name, arguments: tc.arguments})
+    }
+    Phase.Empty | Phase.Content | Phase.Refusal | Phase.Finished => None
+  }
+}
