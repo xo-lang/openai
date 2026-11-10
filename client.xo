@@ -131,7 +131,8 @@ fn os_name() -> Str {
     Linux => "Linux"
     Darwin => "MacOS"
     Windows => "Windows"
-    Wasi => "other:wasip1"
+    Wasi => "Other:wasip1"
+    FreeBSD => "FreeBSD"
   }
 }
 
@@ -141,6 +142,7 @@ fn arch_name() -> Str {
     Amd64 => "x64"
     Arm64 => "arm64"
     Wasm32 => "other:wasm"
+    Riscv64 => "other:riscv64"
   }
 }
 
