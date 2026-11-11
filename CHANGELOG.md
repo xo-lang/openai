@@ -1,6 +1,6 @@
 # Changelog
 
-## v0.1.0 (unreleased)
+## v0.1.0 (2026-11-11)
 
 The first release: the surface Azure OpenAI uses, ported from openai-go
 v3.98.0 (README.md, "Scope of v0.1.0"): the client with Go's retries and
