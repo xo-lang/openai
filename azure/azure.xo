@@ -9,6 +9,8 @@
 
 use std/http
 use std/json
+use std/mime
+use std/multipart
 use std/url
 use github.com/xo-lang/openai
 use github.com/xo-lang/azure/azcore
@@ -23,6 +25,9 @@ pub const TOKEN_USER_AGENT: Str = "xo-lang-openai-azure/v0.1.0"
 /// Routes whose JSON body names the deployment in `model` (Go's
 /// jsonRoutes).
 const JSON_ROUTES: List[Str] = ["/completions", "/chat/completions", "/embeddings", "/audio/speech", "/images/generations"]
+
+/// Go's multipartRoutes: the model is the form's `model` part.
+const MULTIPART_ROUTES: List[Str] = ["/audio/transcriptions", "/audio/translations", "/images/edits"]
 
 /// Go's azure.WithEndpoint, WithAPIKey, WithTokenCredential (with
 /// WithTokenCredentialScopes) and WithUnsafeAllowHTTP as one value.
@@ -99,6 +104,11 @@ pub fn options[fx: Effects](a: AzureOptions[fx], o: openai.Options[fx] = openai.
         return Err("azure: deployment routing requires a non-empty model field")
       }
       rewritten = "/openai/deployments/${url.path_escape(model)}${path}"
+    } else if MULTIPART_ROUTES.contains(plain) {
+      let mt = mime.parse_media_type(req.header("Content-Type") ?? "") ?? e => return Err(e.display())
+      let parts = multipart.parse(req.body, mt.params.get("boundary") ?? "") ?? e => return Err(e.display())
+      let model = parts.find(fn(p: multipart.Part) -> Bool { p.name == "model" }) ?? return Err("unable to find the model part in multipart body")
+      rewritten = "/openai/deployments/${url.path_escape(model.data.to_str_lossy())}${path}"
     }
     let q = req.raw_query()
     let av = "api-version=${url.query_escape(a.api_version)}"

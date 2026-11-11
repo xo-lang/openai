@@ -111,10 +111,30 @@ built in tools (file and web search, computer use, MCP, code
 interpreter) and structured output helpers. Vectors: sections p1 to
 p8 and z6 of the Go program.
 
+## Amendment 3 (2026-11-10): images
+
+Go's azopenai examples call `Images.Generate` once; `Edit` comes in the
+same slice because it is the first multipart route and audio needs the
+same encoder (`form.xo`).
+
+- `generate_images` (POST images/generations, JSON in Go's struct order)
+  and `edit_images` (POST images/edits, a multipart form). The form is
+  written by std/multipart (`write`, `random_boundary`, Go's 60 hex
+  digit boundary): fields sorted by name as Go's apiform writes them,
+  one image as `image`, several as `image[]` each, a file's name and
+  content type defaulting to Go's `anonymous_file` and
+  `application/octet-stream`.
+- The `azure` package routes images/edits (and the audio
+  transcriptions and translations routes) by the form's `model` part,
+  as Go's getMultipartRoute; without one, Go's `unable to find the model
+  part in multipart body`.
+- Deferred: variations, streamed generation and edits, the GIF and SVG
+  options. Vectors: i1 to i5 and z7 (the boundary masked on both sides).
+
 ## Deferred
 
 The rest of the Responses API (Amendment 2), assistants, threads and the other
-beta APIs, audio, images, files and uploads, batches, fine tuning,
+beta APIs, audio, image variations and streaming, files and uploads, batches, fine tuning,
 vector stores, moderation, models, containers, the admin APIs,
 realtime and websockets, webhooks, the Bedrock and other provider
 packages, and `azopenai`'s re-ported helpers that need the client.

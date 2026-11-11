@@ -1,0 +1,59 @@
+// Replays the Go program's image calls (sections i1 to i5 of
+// vectors_test.xo) against the same fake.
+
+const IMG_URL: Str = "{\"created\":1713833628,\"data\":[{\"url\":\"https://example.test/img/1.png\",\"revised_prompt\":\"A small grey cat.\"}],\"background\":\"opaque\",\"output_format\":\"png\",\"quality\":\"high\",\"size\":\"1024x1024\"}"
+
+const IMG_B64: Str = "{\"created\":1713833629,\"data\":[{\"b64_json\":\"iVBORw0KGgo=\"},{\"b64_json\":\"AAAA\"}],\"usage\":{\"input_tokens\":50,\"input_tokens_details\":{\"image_tokens\":40,\"text_tokens\":10},\"output_tokens\":100,\"total_tokens\":150}}"
+
+/// The Go program's showImages line.
+fn images_line(r: ImagesResponse) -> Str {
+  let ds = r.data.map(fn(d: ImageData) -> Str { "(url=${d.url} b64=${d.b64_json} revised=${q(d.revised_prompt)})" }).join(" ")
+  let u = r.usage
+  "created=${r.created} data=${ds} background=${r.background} format=${r.output_format} quality=${r.quality} size=${r.size} usage=${u.input_tokens}/${u.output_tokens}/${u.total_tokens} image=${u.image_tokens} text=${u.text_tokens}"
+}
+
+fn show_images(f: Fake, label: Str, r: Result[ImagesResponse, OpenAIErr]) {
+  match r {
+    Ok(x) => show(f, label, images_line(x))
+    Err(e) => show_err(f, label, e)
+  }
+}
+
+test "openai-go's images: generate and edit" {
+  let f = serve(os.net, "api.example.test")
+  let c = new_client(os.net, os.clock, os.rand, Options[()]{base_url: "https://api.example.test/v1/", api_key: "test-key", organization: "org-test", project: "proj-test"})
+  let none: List[(Str, Str)] = []
+
+  start(f, "i1")
+  on(f, "POST /v1/images/generations", [(200, none, IMG_URL)])
+  show_images(f, "images generate url", c.generate_images(ImageGenerateParams{prompt: "a cat", model: "dall-e-3", n: Some(1), response_format: "url", size: "1024x1024", quality: "hd", style: "natural", user: Some("u-1")}))
+
+  start(f, "i2")
+  on(f, "POST /v1/images/generations", [(200, none, IMG_B64)])
+  show_images(f, "images generate b64", c.generate_images(ImageGenerateParams{prompt: "two dogs", model: "gpt-image-1", n: Some(2), background: "transparent", output_format: "webp", output_compression: Some(80)}))
+
+  start(f, "i3")
+  on(f, "POST /v1/images/edits", [(200, none, IMG_B64)])
+  show_images(f, "images edit", c.edit_images(ImageEditParams{
+    image: ImageInput.One(FileUpload{data: b"PNGDATA1", filename: "cat.png", content_type: "image/png"}),
+    prompt: "add a hat",
+    mask: Some(FileUpload{data: b"MASK", filename: "mask.png", content_type: "image/png"}),
+    model: "gpt-image-1",
+    n: Some(1),
+    size: "1024x1024",
+  }))
+
+  start(f, "i4")
+  on(f, "POST /v1/images/edits", [(200, none, IMG_B64)])
+  show_images(f, "images edit two images", c.edit_images(ImageEditParams{
+    image: ImageInput.Many([FileUpload{data: b"A", filename: "a.png", content_type: "image/png"}, FileUpload{data: b"B"}]),
+    prompt: "merge",
+    input_fidelity: "high",
+  }))
+
+  start(f, "i5")
+  on(f, "POST /v1/images/generations", [(400, none, "{\"error\":{\"message\":\"Your request was rejected by the safety system.\",\"type\":\"image_generation_user_error\",\"param\":null,\"code\":\"content_policy_violation\"}}")])
+  show_images(f, "images generate rejected", c.generate_images(ImageGenerateParams{prompt: "x", model: "dall-e-3"}))
+
+  compare(f, ["i1", "i2", "i3", "i4", "i5"])
+}

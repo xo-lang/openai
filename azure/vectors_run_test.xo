@@ -1,9 +1,10 @@
-// Replays the Go program's Azure calls (z1 to z6, vectors_test.xo)
+// Replays the Go program's Azure calls (z1 to z7, vectors_test.xo)
 // against the same fake: a loopback http host, a credential that counts
 // its tokens.
 
 use std/http
 use std/json
+use std/mime
 use std/testing
 use github.com/xo-lang/openai
 use github.com/xo-lang/azure/azcore
@@ -29,8 +30,20 @@ fn sec(f: Fake) -> Str {
 const MASKED: List[Str] = ["x-stainless-os", "x-stainless-arch", "x-stainless-runtime-version"]
 
 fn answer(f: Fake, req: http.Request) -> http.Response {
+  // a multipart body's random boundary, masked in the headers and the
+  // body, its CRLFs written as \r\n (as the Go program logs them)
+  let bound = match mime.parse_media_type(req.header("Content-Type") ?? "") {
+    Ok(mt) => mt.params.get("boundary") ?? ""
+    Err(_) => ""
+  }
+  var body = req.body.to_str_lossy()
+  if bound != "" {
+    body = body.replace(bound, "<boundary>").replace("\r\n", "\\r\\n")
+  }
   var hs: List[Str] = []
-  for (k, v) in req.headers {
+  for (k0, v0) in req.headers {
+    let k = k0
+    let v = if bound == "" { v0 } else { v0.replace(bound, "<boundary>") }
     let lk = k.to_lower()
     if lk == "accept-encoding" || lk == "content-length" || lk == "host" {
       continue
@@ -41,7 +54,7 @@ fn answer(f: Fake, req: http.Request) -> http.Response {
   let qs = req.raw_query()
   note(f, "${sec(f)}: REQ ${req.method} ${req.escaped_path()}${if qs == "" { "" } else { "?${qs}" }}")
   note(f, "  H ${hs.sort().join(" | ")}")
-  note(f, "  B ${req.body.to_str_lossy()}")
+  note(f, "  B ${body}")
   let key = "${req.method} ${req.url.path}"
   let r = f.q.with(fn(var m: Map[Str, List[(Int, List[(Str, Str)], Str)]]) -> (Int, List[(Str, Str)], Str)? {
     let rs = m.get(key) ?? return None
@@ -214,7 +227,21 @@ test "openai-go's azure package: endpoint, api key, token credential, plain http
   on(f, "DELETE /openai/v1/responses/resp_1", [(200, none, "")])
   ok("azure responses delete", azr.delete_response("resp_1"))
 
-  compare(f, ["z1", "z2", "z3", "z5", "z4", "z6"])
+  start(f, "z7")
+  on(f, "POST /openai/deployments/dall-e-3/images/generations", [(200, none, IMG_URL)])
+  on(f, "POST /openai/deployments/gpt-image-1/images/edits", [(200, none, IMG_B64)])
+  let cat = openai.FileUpload{data: b"PNGDATA1", filename: "cat.png", content_type: "image/png"}
+  let img = fn(label: Str, r: Result[openai.ImagesResponse, openai.OpenAIErr]) {
+    match r {
+      Ok(x) => show(f, label, images_line(x))
+      Err(e) => show_err(f, label, e)
+    }
+  }
+  img("azure images generate", azr.generate_images(openai.ImageGenerateParams{prompt: "a cat", model: "dall-e-3", response_format: "url", size: "1024x1024"}))
+  img("azure images edit", azr.edit_images(openai.ImageEditParams{image: openai.ImageInput.One(cat), prompt: "add a hat", model: "gpt-image-1"}))
+  img("azure images edit without model", azr.edit_images(openai.ImageEditParams{image: openai.ImageInput.One(cat), prompt: "no model"}))
+
+  compare(f, ["z1", "z2", "z3", "z5", "z4", "z6", "z7"])
 }
 
 const RESP_TEXT: Str = "{\"id\":\"resp_1\",\"object\":\"response\",\"created_at\":1741476542,\"status\":\"completed\",\"model\":\"gpt-4o-2024-08-06\",\"output\":[{\"type\":\"message\",\"id\":\"msg_1\",\"status\":\"completed\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Forgetting \",\"annotations\":[]},{\"type\":\"output_text\",\"text\":\"is loss.\",\"annotations\":[]}]}],\"usage\":{\"input_tokens\":36,\"input_tokens_details\":{\"cached_tokens\":4},\"output_tokens\":87,\"output_tokens_details\":{\"reasoning_tokens\":0},\"total_tokens\":123}}"
@@ -231,4 +258,15 @@ fn response_line(r: openai.Response) -> Str {
   }
   let u = r.usage
   "id=${r.id} model=${r.model} status=${r.status} created=${r.created_at} prev=${q(r.previous_response_id)} output_text=${q(r.output_text())} items=${items.join(" ")} usage=${u.input_tokens}/${u.output_tokens}/${u.total_tokens} cached=${u.cached_tokens} reasoning=${u.reasoning_tokens}"
+}
+
+const IMG_URL: Str = "{\"created\":1713833628,\"data\":[{\"url\":\"https://example.test/img/1.png\",\"revised_prompt\":\"A small grey cat.\"}],\"background\":\"opaque\",\"output_format\":\"png\",\"quality\":\"high\",\"size\":\"1024x1024\"}"
+
+const IMG_B64: Str = "{\"created\":1713833629,\"data\":[{\"b64_json\":\"iVBORw0KGgo=\"},{\"b64_json\":\"AAAA\"}],\"usage\":{\"input_tokens\":50,\"input_tokens_details\":{\"image_tokens\":40,\"text_tokens\":10},\"output_tokens\":100,\"total_tokens\":150}}"
+
+/// The Go program's showImages line.
+fn images_line(r: openai.ImagesResponse) -> Str {
+  let ds = r.data.map(fn(d: openai.ImageData) -> Str { "(url=${d.url} b64=${d.b64_json} revised=${q(d.revised_prompt)})" }).join(" ")
+  let u = r.usage
+  "created=${r.created} data=${ds} background=${r.background} format=${r.output_format} quality=${r.quality} size=${r.size} usage=${u.input_tokens}/${u.output_tokens}/${u.total_tokens} image=${u.image_tokens} text=${u.text_tokens}"
 }

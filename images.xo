@@ -1,0 +1,151 @@
+// Images: generate (JSON) and edit (a multipart form).
+//
+// Ported from github.com/openai/openai-go v3.98.0 (image.go), Copyright
+// 2026 OpenAI, Apache License 2.0. Changed from the original: rewritten
+// in Xo; a subset of the parameters (the rest through `extra`); no
+// streamed images (NOTICE.md).
+
+use std/json
+
+/// Go's ImageGenerateParams (a subset; any other field through `extra`).
+/// Enum fields are Go's strings ("dall-e-3", "1024x1024", "hd", "url");
+/// "" is omitted.
+pub struct ImageGenerateParams {
+  pub prompt: Str
+  pub model: Str = ""
+  pub n: Int? = None
+  pub output_compression: Int? = None
+  pub partial_images: Int? = None
+  pub safety_identifier: Str? = None
+  pub user: Str? = None
+  pub background: Str = ""
+  pub moderation: Str = ""
+  pub output_format: Str = ""
+  pub quality: Str = ""
+  pub response_format: Str = ""
+  pub size: Str = ""
+  pub style: Str = ""
+  pub extra: List[(Str, json.Value)] = []
+}
+
+/// The request body in Go's field order.
+pub fn (p: ImageGenerateParams) to_json() -> json.Value {
+  var f: List[(Str, json.Value)] = [("prompt", jstr(p.prompt))]
+  f = f + opt_int("n", p.n)
+  f = f + opt_int("output_compression", p.output_compression)
+  f = f + opt_int("partial_images", p.partial_images)
+  f = f + opt_str("safety_identifier", p.safety_identifier)
+  f = f + opt_str("user", p.user)
+  f = f + opt_nonempty("background", p.background)
+  f = f + opt_nonempty("model", p.model)
+  f = f + opt_nonempty("moderation", p.moderation)
+  f = f + opt_nonempty("output_format", p.output_format)
+  f = f + opt_nonempty("quality", p.quality)
+  f = f + opt_nonempty("response_format", p.response_format)
+  f = f + opt_nonempty("size", p.size)
+  f = f + opt_nonempty("style", p.style)
+  for x in p.extra {
+    f.push(x)
+  }
+  json.Value.Object(f)
+}
+
+/// Go's ImageEditParamsImageUnion: one image (the field `image`) or
+/// several (`image[]`, each).
+pub enum ImageInput {
+  One(file: FileUpload)
+  Many(files: List[FileUpload])
+}
+
+/// Go's ImageEditParams (a subset; other text fields through `extra`).
+pub struct ImageEditParams {
+  pub image: ImageInput
+  pub prompt: Str
+  pub mask: FileUpload? = None
+  pub model: Str = ""
+  pub n: Int? = None
+  pub output_compression: Int? = None
+  pub safety_identifier: Str? = None
+  pub user: Str? = None
+  pub background: Str = ""
+  pub input_fidelity: Str = ""
+  pub output_format: Str = ""
+  pub quality: Str = ""
+  pub response_format: Str = ""
+  pub size: Str = ""
+  pub extra: List[(Str, Str)] = []
+}
+
+fn (p: ImageEditParams) form() -> List[(Str, FormValue)] {
+  var f: List[(Str, FormValue)] = match p.image {
+    ImageInput.One(x) => [("image", FormValue.File(x))]
+    ImageInput.Many(xs) => xs.map(fn(x: FileUpload) -> (Str, FormValue) { ("image[]", FormValue.File(x)) })
+  }
+  f.push(("prompt", FormValue.Text(p.prompt)))
+  if let Some(m) = p.mask {
+    f.push(("mask", FormValue.File(m)))
+  }
+  f = f + opt_form_int("n", p.n) + opt_form_int("output_compression", p.output_compression)
+  f = f + opt_form_str("safety_identifier", p.safety_identifier) + opt_form_str("user", p.user)
+  f = f + form_nonempty("background", p.background) + form_nonempty("input_fidelity", p.input_fidelity)
+  f = f + form_nonempty("model", p.model) + form_nonempty("output_format", p.output_format)
+  f = f + form_nonempty("quality", p.quality) + form_nonempty("response_format", p.response_format)
+  f = f + form_nonempty("size", p.size)
+  for (k, v) in p.extra {
+    f.push((k, FormValue.Text(v)))
+  }
+  f
+}
+
+/// Go's Image: a URL or base64 data, and the prompt the model used.
+pub struct ImageData {
+  pub b64_json: Str = ""
+  pub revised_prompt: Str = ""
+  pub url: Str = ""
+}
+
+/// Go's ImagesResponseUsage with the input details.
+pub struct ImageUsage {
+  pub input_tokens: Int = 0
+  pub output_tokens: Int = 0
+  pub total_tokens: Int = 0
+  pub image_tokens: Int = 0
+  pub text_tokens: Int = 0
+}
+
+/// Go's ImagesResponse; `raw` is the whole response for any other field.
+pub struct ImagesResponse {
+  pub created: Int = 0
+  pub data: List[ImageData] = []
+  pub background: Str = ""
+  pub output_format: Str = ""
+  pub quality: Str = ""
+  pub size: Str = ""
+  pub usage: ImageUsage = ImageUsage{}
+  pub raw: json.Value = json.Value.Null
+}
+
+fn images_of(v: json.Value) -> ImagesResponse {
+  let u = obj_of(v, "usage")
+  let d = obj_of(u, "input_tokens_details")
+  ImagesResponse{
+    created: int_of(v, "created"),
+    data: list_of(v, "data").map(fn(x: json.Value) -> ImageData { ImageData{b64_json: str_of(x, "b64_json"), revised_prompt: str_of(x, "revised_prompt"), url: str_of(x, "url")} }),
+    background: str_of(v, "background"),
+    output_format: str_of(v, "output_format"),
+    quality: str_of(v, "quality"),
+    size: str_of(v, "size"),
+    usage: ImageUsage{input_tokens: int_of(u, "input_tokens"), output_tokens: int_of(u, "output_tokens"), total_tokens: int_of(u, "total_tokens"), image_tokens: int_of(d, "image_tokens"), text_tokens: int_of(d, "text_tokens")},
+    raw: v,
+  }
+}
+
+/// Go's Images.Generate: POST images/generations.
+pub fn (c: Client[fx]) generate_images(p: ImageGenerateParams, co: CallOptions = CallOptions{}) -> ImagesResponse ! OpenAIErr uses (net.dial, clock, rand, fx) {
+  Ok(images_of(c.call_json("POST", "images/generations", Some(p.to_json()), co)?))
+}
+
+/// Go's Images.Edit: POST images/edits, a multipart form.
+pub fn (c: Client[fx]) edit_images(p: ImageEditParams, co: CallOptions = CallOptions{}) -> ImagesResponse ! OpenAIErr uses (net.dial, clock, rand, fx) {
+  Ok(images_of(c.call_raw("POST", "images/edits", Some(c.form_body(p.form())), co)?))
+}

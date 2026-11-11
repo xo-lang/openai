@@ -1,0 +1,65 @@
+// Multipart form bodies, as openai-go's apiform writes them.
+//
+// Ported from github.com/openai/openai-go v3.98.0 (internal/apiform,
+// field.go's File), Copyright 2026 OpenAI, Apache License 2.0. Changed
+// from the original: rewritten in Xo over std/multipart's writer; only
+// text and file fields (NOTICE.md).
+
+use std/multipart
+
+/// A file to upload (Go's openai.File): its bytes, file name and content
+/// type. The defaults are Go's for a plain io.Reader.
+pub struct FileUpload {
+  pub data: Bytes
+  pub filename: Str = "anonymous_file"
+  pub content_type: Str = "application/octet-stream"
+}
+
+/// One field of a form: a text value or a file.
+enum FormValue {
+  Text(text: Str)
+  File(file: FileUpload)
+}
+
+fn opt_form_str(k: Str, v: Str?) -> List[(Str, FormValue)] {
+  match v {
+    Some(x) => [(k, FormValue.Text(x))]
+    None => []
+  }
+}
+
+fn opt_form_int(k: Str, v: Int?) -> List[(Str, FormValue)] {
+  match v {
+    Some(x) => [(k, FormValue.Text("${x}"))]
+    None => []
+  }
+}
+
+fn opt_form_num(k: Str, v: Float?) -> List[(Str, FormValue)] {
+  match v {
+    Some(x) => [(k, FormValue.Text(x.to_general(-1)))]
+    None => []
+  }
+}
+
+fn form_nonempty(k: Str, v: Str) -> List[(Str, FormValue)] {
+  if v == "" { [] } else { [(k, FormValue.Text(v))] }
+}
+
+/// The body: the fields sorted by name (Go's apiform walks them so), a
+/// field's repeated values in their order, under a random boundary.
+fn (c: Client[fx]) form_body(fields: List[(Str, FormValue)]) -> RawBody uses rand {
+  var keyed: List[(Str, multipart.Part)] = []
+  var i = 0
+  for (name, v) in fields {
+    let part = match v {
+      FormValue.Text(t) => multipart.Part{name: name, filename: None, headers: {}, data: t.bytes()}
+      FormValue.File(f) => multipart.Part{name: name, filename: Some(f.filename), headers: {"Content-Type": f.content_type}, data: f.data}
+    }
+    keyed.push(("${name}\u{0}${"${1000000 + i}"}", part))
+    i = i + 1
+  }
+  let parts = keyed.sort_by(fn(x: (Str, multipart.Part)) -> Str { x.0 }).map(fn(x: (Str, multipart.Part)) -> multipart.Part { x.1 })
+  let b = multipart.random_boundary(c.rand)
+  (multipart.write(parts, b), multipart.form_data_content_type(b))
+}

@@ -152,7 +152,18 @@ fn (c: Client[fx]) base() -> Str {
 }
 
 /// The request a call starts from: the URL, Go's headers, the body.
-fn (c: Client[fx]) build(method: Str, path: Str, body: json.Value?, co: CallOptions) -> http.Request {
+/// A request body as bytes and its content type: JSON, or a multipart
+/// form.
+type RawBody = (Bytes, Str)
+
+fn json_body(body: json.Value?) -> RawBody? {
+  match body {
+    Some(v) => Some((v.encode().bytes(), "application/json"))
+    None => None
+  }
+}
+
+fn (c: Client[fx]) build(method: Str, path: Str, body: RawBody?, co: CallOptions) -> http.Request {
   var u = c.base() + path.trim_prefix("/")
   var q: List[Str] = []
   for (k, v) in c.o.query + co.query {
@@ -184,9 +195,9 @@ fn (c: Client[fx]) build(method: Str, path: Str, body: json.Value?, co: CallOpti
     hs["X-Stainless-Timeout"] = "${c.o.request_timeout.millis() / 1000}"
   }
   var b = b""
-  if let Some(v) = body {
-    hs["Content-Type"] = "application/json"
-    b = v.encode().bytes()
+  if let Some((data, ct)) = body {
+    hs["Content-Type"] = ct
+    b = data
   }
   for (k, v) in c.o.headers + co.headers {
     hs[k] = v
@@ -289,6 +300,10 @@ fn api_err(r: http.Response) -> OpenAIErr {
 /// A call: the hooks once, then the tries with Go's retry rules. An
 /// error status after the last try is Api.
 pub fn (c: Client[fx]) execute(method: Str, path: Str, body: json.Value?, co: CallOptions = CallOptions{}) -> http.Response ! OpenAIErr uses (net.dial, clock, rand, fx) {
+  c.execute_raw(method, path, json_body(body), co)
+}
+
+fn (c: Client[fx]) execute_raw(method: Str, path: Str, body: RawBody?, co: CallOptions) -> http.Response ! OpenAIErr uses (net.dial, clock, rand, fx) {
   var req = c.build(method, path, body, co)
   for h in c.o.hooks {
     req = h(req) ?? e => return Err(OpenAIErr.Request(e))
@@ -327,6 +342,12 @@ pub fn (c: Client[fx]) execute(method: Str, path: Str, body: json.Value?, co: Ca
 
 /// A call whose response is JSON, decoded.
 pub fn (c: Client[fx]) call_json(method: Str, path: Str, body: json.Value?, co: CallOptions = CallOptions{}) -> json.Value ! OpenAIErr uses (net.dial, clock, rand, fx) {
-  let r = c.execute(method, path, body, co)?
+  c.call_raw(method, path, json_body(body), co)
+}
+
+/// A call with a body already encoded (a multipart form), its JSON
+/// response decoded.
+fn (c: Client[fx]) call_raw(method: Str, path: Str, body: RawBody?, co: CallOptions) -> json.Value ! OpenAIErr uses (net.dial, clock, rand, fx) {
+  let r = c.execute_raw(method, path, body, co)?
   json.parse_value(r.body.to_str_lossy()) ?? e => Err(OpenAIErr.Decode(e.display()))
 }

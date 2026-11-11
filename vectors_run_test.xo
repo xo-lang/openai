@@ -4,6 +4,7 @@
 
 use std/http
 use std/json
+use std/mime
 use std/testing
 
 struct Fake {
@@ -23,8 +24,20 @@ fn sec(f: Fake) -> Str {
 const MASKED: List[Str] = ["x-stainless-os", "x-stainless-arch", "x-stainless-runtime-version"]
 
 fn answer(f: Fake, req: http.Request) -> http.Response {
+  // a multipart body's random boundary, masked in the headers and the
+  // body, its CRLFs written as \r\n (as the Go program logs them)
+  let bound = match mime.parse_media_type(req.header("Content-Type") ?? "") {
+    Ok(mt) => mt.params.get("boundary") ?? ""
+    Err(_) => ""
+  }
+  var body = req.body.to_str_lossy()
+  if bound != "" {
+    body = body.replace(bound, "<boundary>").replace("\r\n", "\\r\\n")
+  }
   var hs: List[Str] = []
-  for (k, v) in req.headers {
+  for (k0, v0) in req.headers {
+    let k = k0
+    let v = if bound == "" { v0 } else { v0.replace(bound, "<boundary>") }
     let lk = k.to_lower()
     if lk == "accept-encoding" || lk == "content-length" || lk == "host" {
       continue
@@ -34,7 +47,7 @@ fn answer(f: Fake, req: http.Request) -> http.Response {
   let qs = req.raw_query()
   note(f, "${sec(f)}: REQ ${req.method} ${req.escaped_path()}${if qs == "" { "" } else { "?${qs}" }}")
   note(f, "  H ${hs.sort().join(" | ")}")
-  note(f, "  B ${req.body.to_str_lossy()}")
+  note(f, "  B ${body}")
   let key = "${req.method} ${req.url.path}"
   let r = f.q.with(fn(var m: Map[Str, List[(Int, List[(Str, Str)], Str)]]) -> (Int, List[(Str, Str)], Str)? {
     let rs = m.get(key) ?? return None

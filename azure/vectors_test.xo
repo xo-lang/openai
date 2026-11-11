@@ -41,4 +41,13 @@ const GO_OPENAI_LINES: List[Str] = [
   "  H accept=*/* | api-key=az-key | user-agent=OpenAI/Xo 3.98.0 | x-stainless-arch=<x-stainless-arch> | x-stainless-lang=xo | x-stainless-os=<x-stainless-os> | x-stainless-package-version=3.98.0 | x-stainless-retry-count=0 | x-stainless-runtime-version=<x-stainless-runtime-version> | x-stainless-runtime=xo",
   "  B ",
   "z6: azure responses delete: ok",
+  "z7: REQ POST /openai/deployments/dall-e-3/images/generations?api-version=2025-04-01-preview",
+  "  H accept=application/json | api-key=az-key | content-type=application/json | user-agent=OpenAI/Xo 3.98.0 | x-stainless-arch=<x-stainless-arch> | x-stainless-lang=xo | x-stainless-os=<x-stainless-os> | x-stainless-package-version=3.98.0 | x-stainless-retry-count=0 | x-stainless-runtime-version=<x-stainless-runtime-version> | x-stainless-runtime=xo",
+  "  B {\"prompt\":\"a cat\",\"model\":\"dall-e-3\",\"response_format\":\"url\",\"size\":\"1024x1024\"}",
+  "z7: azure images generate: created=1713833628 data=(url=https://example.test/img/1.png b64= revised=\"A small grey cat.\") background=opaque format=png quality=high size=1024x1024 usage=0/0/0 image=0 text=0",
+  "z7: REQ POST /openai/deployments/gpt-image-1/images/edits?api-version=2025-04-01-preview",
+  "  H accept=application/json | api-key=az-key | content-type=multipart/form-data; boundary=<boundary> | user-agent=OpenAI/Xo 3.98.0 | x-stainless-arch=<x-stainless-arch> | x-stainless-lang=xo | x-stainless-os=<x-stainless-os> | x-stainless-package-version=3.98.0 | x-stainless-retry-count=0 | x-stainless-runtime-version=<x-stainless-runtime-version> | x-stainless-runtime=xo",
+  "  B --<boundary>\\r\\nContent-Disposition: form-data; name=\"image\"; filename=\"cat.png\"\\r\\nContent-Type: image/png\\r\\n\\r\\nPNGDATA1\\r\\n--<boundary>\\r\\nContent-Disposition: form-data; name=\"model\"\\r\\n\\r\\ngpt-image-1\\r\\n--<boundary>\\r\\nContent-Disposition: form-data; name=\"prompt\"\\r\\n\\r\\nadd a hat\\r\\n--<boundary>--\\r\\n",
+  "z7: azure images edit: created=1713833629 data=(url= b64=iVBORw0KGgo= revised=\"\") (url= b64=AAAA revised=\"\") background= format= quality= size= usage=50/100/150 image=40 text=10",
+  "z7: azure images edit without model: error: unable to find the model part in multipart body",
 ]

@@ -211,7 +211,7 @@ pub fn (st: ChatStream) close() {
 /// A call whose response body is a stream: the tries as `execute`, the
 /// body left open on success.
 fn (c: Client[fx]) open(method: Str, path: Str, body: json.Value?, co: CallOptions) -> http.ClientStream ! OpenAIErr uses (net.dial, clock, rand, fx) {
-  var req = c.build(method, path, body, co)
+  var req = c.build(method, path, json_body(body), co)
   for h in c.o.hooks {
     req = h(req) ?? e => return Err(OpenAIErr.Request(e))
   }
