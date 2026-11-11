@@ -1,0 +1,135 @@
+// Legacy completions: create and stream.
+//
+// Ported from github.com/openai/openai-go v3.98.0 (completion.go),
+// Copyright 2026 OpenAI, Apache License 2.0. Changed from the original:
+// rewritten in Xo; a pull reader in place of Go's iterator; logprobs
+// read from `raw` (NOTICE.md).
+
+use std/json
+
+/// Go's CompletionNewParamsPromptUnion.
+pub enum CompletionPrompt {
+  Text(text: Str)
+  Texts(texts: List[Str])
+  Tokens(tokens: List[Int])
+  TokenLists(lists: List[List[Int]])
+}
+
+/// Go's CompletionNewParams; any other field through `extra`.
+pub struct CompletionParams {
+  pub model: Str
+  pub prompt: CompletionPrompt
+  pub best_of: Int? = None
+  pub echo: Bool? = None
+  pub frequency_penalty: Float? = None
+  pub logprobs: Int? = None
+  pub max_tokens: Int? = None
+  pub n: Int? = None
+  pub presence_penalty: Float? = None
+  pub seed: Int? = None
+  pub suffix: Str? = None
+  pub temperature: Float? = None
+  pub top_p: Float? = None
+  pub user: Str? = None
+  /// Token ids (as text) to their bias; written with sorted keys, as Go
+  /// writes its map.
+  pub logit_bias: List[(Str, Int)] = []
+  pub stop: Stop? = None
+  /// Go's StreamOptions.IncludeUsage, for a stream.
+  pub include_usage: Bool? = None
+  pub extra: List[(Str, json.Value)] = []
+}
+
+/// The request body in Go's field order; `stream` adds Go's
+/// `"stream": true` last.
+pub fn (p: CompletionParams) to_json(stream: Bool = false) -> json.Value {
+  let ints = fn(xs: List[Int]) -> json.Value { json.Value.List(xs.map(fn(x: Int) -> json.Value { json.Value.Int(x) })) }
+  var f: List[(Str, json.Value)] = [("prompt", match p.prompt {
+    CompletionPrompt.Text(t) => jstr(t)
+    CompletionPrompt.Texts(ts) => json.Value.List(ts.map(jstr))
+    CompletionPrompt.Tokens(ts) => ints(ts)
+    CompletionPrompt.TokenLists(ls) => json.Value.List(ls.map(ints))
+  })]
+  f = f + opt_nonempty("model", p.model)
+  f = f + opt_int("best_of", p.best_of) + opt_boo("echo", p.echo) + opt_num("frequency_penalty", p.frequency_penalty)
+  f = f + opt_int("logprobs", p.logprobs) + opt_int("max_tokens", p.max_tokens) + opt_int("n", p.n)
+  f = f + opt_num("presence_penalty", p.presence_penalty) + opt_int("seed", p.seed) + opt_str("suffix", p.suffix)
+  f = f + opt_num("temperature", p.temperature) + opt_num("top_p", p.top_p) + opt_str("user", p.user)
+  if !p.logit_bias.is_empty() {
+    f.push(("logit_bias", sorted(json.Value.Object(p.logit_bias.map(fn(x: (Str, Int)) -> (Str, json.Value) { (x.0, json.Value.Int(x.1)) })))))
+  }
+  if let Some(s) = p.stop {
+    f.push(("stop", match s {
+      Stop.One(x) => jstr(x)
+      Stop.Many(xs) => json.Value.List(xs.map(jstr))
+    }))
+  }
+  if let Some(u) = p.include_usage {
+    f.push(("stream_options", json.Value.Object([("include_usage", json.Value.Bool(u))])))
+  }
+  for x in p.extra {
+    f.push(x)
+  }
+  if stream {
+    f.push(("stream", json.Value.Bool(true)))
+  }
+  json.Value.Object(f)
+}
+
+/// Go's CompletionChoice; logprobs in the completion's `raw`.
+pub struct CompletionChoice {
+  pub index: Int = 0
+  pub text: Str = ""
+  pub finish_reason: Str = ""
+}
+
+/// Go's Completion (a whole one, or a streamed chunk); `raw` is its JSON.
+pub struct Completion {
+  pub id: Str = ""
+  pub object: Str = ""
+  pub created: Int = 0
+  pub model: Str = ""
+  pub system_fingerprint: Str = ""
+  pub choices: List[CompletionChoice] = []
+  pub usage: Usage = Usage{}
+  pub raw: json.Value = json.Value.Null
+}
+
+fn legacy_of(v: json.Value) -> Completion {
+  Completion{
+    id: str_of(v, "id"),
+    object: str_of(v, "object"),
+    created: int_of(v, "created"),
+    model: str_of(v, "model"),
+    system_fingerprint: str_of(v, "system_fingerprint"),
+    choices: list_of(v, "choices").map(fn(c: json.Value) -> CompletionChoice { CompletionChoice{index: int_of(c, "index"), text: str_of(c, "text"), finish_reason: str_of(c, "finish_reason")} }),
+    usage: usage_of(v),
+    raw: v,
+  }
+}
+
+/// Go's Completions.New: POST completions.
+pub fn (c: Client[fx]) completion(p: CompletionParams, co: CallOptions = CallOptions{}) -> Completion ! OpenAIErr uses (net.dial, clock, rand, fx) {
+  Ok(legacy_of(c.call_json("POST", "completions", Some(p.to_json()), co)?))
+}
+
+/// A streamed completion (Go's ssestream.Stream[Completion]): `next`
+/// gives each chunk, None at the end.
+pub struct CompletionStream {
+  e: Events
+}
+
+pub fn (st: CompletionStream) next() -> Completion? ! OpenAIErr uses net.dial {
+  Ok(st.e.next_value()?.map(legacy_of))
+}
+
+/// Releases the stream; reading after does nothing.
+pub fn (st: CompletionStream) close() {
+  st.e.close()
+}
+
+/// Go's Completions.NewStreaming: the body with `"stream": true`.
+pub fn (c: Client[fx]) completion_stream(p: CompletionParams, co: CallOptions = CallOptions{}) -> CompletionStream ! OpenAIErr uses (net.dial, clock, rand, fx) {
+  let s = c.open("POST", "completions", Some(p.to_json(stream: true)), co)?
+  Ok(CompletionStream{e: events(s)})
+}

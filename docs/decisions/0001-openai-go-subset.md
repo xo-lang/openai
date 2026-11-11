@@ -153,6 +153,18 @@ Go's azopenai examples call `Audio.Transcriptions.New`,
   points those at Client.Post), chunking strategy, known speakers,
   custom voices and voice consents. Vectors: a1 to a5 and z8.
 
+## Amendment 5 (2026-11-10): legacy completions
+
+Go's azopenai examples call `Completions.New` and `NewStreaming` once
+each. `completion` and `completion_stream` (POST completions, the second
+with `"stream": true` through the root module's event reader) take a
+prompt as text, texts, tokens or token lists, Go's scalar options,
+`logit_bias` (sorted keys, as Go's map) and `stop` (chat's Stop); the
+result is Go's Completion with its choices and usage, logprobs left in
+`raw`. The `azure` package already routes `/completions` by model.
+Vectors: l1 to l3 and z9. With this, every client call in Go azopenai
+v0.9.0's examples has a port.
+
 ## Deferred
 
 The rest of the Responses API (Amendment 2), assistants, threads and the other

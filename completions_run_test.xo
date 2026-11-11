@@ -1,0 +1,80 @@
+// Replays the Go program's legacy completion calls (sections l1 to l3 of
+// vectors_test.xo) against the same fake.
+
+const LEGACY_RESP: Str = "{\"id\":\"cmpl-1\",\"object\":\"text_completion\",\"created\":1700000010,\"model\":\"gpt-3.5-turbo-instruct\",\"system_fingerprint\":\"fp_9\",\"choices\":[{\"text\":\" there.\",\"index\":0,\"logprobs\":null,\"finish_reason\":\"length\"},{\"text\":\" world.\",\"index\":1,\"logprobs\":null,\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":4,\"total_tokens\":6}}"
+
+fn legacy_chunk(text: Str, finish: Str) -> Str {
+  let fr = if finish == "" { "null" } else { "\"${finish}\"" }
+  "{\"id\":\"cmpl-s\",\"object\":\"text_completion\",\"created\":1700000011,\"model\":\"gpt-3.5-turbo-instruct\",\"choices\":[{\"text\":\"${text}\",\"index\":0,\"logprobs\":null,\"finish_reason\":${fr}}]}"
+}
+
+fn show_completion(f: Fake, label: Str, r: Result[Completion, OpenAIErr]) {
+  match r {
+    Ok(x) => {
+      var s = "id=${x.id} model=${x.model} object=${x.object} created=${x.created} fp=${x.system_fingerprint} usage=${x.usage.prompt_tokens}/${x.usage.completion_tokens}/${x.usage.total_tokens}"
+      for c in x.choices {
+        s = s + " [${c.index} ${q(c.text)} ${c.finish_reason}]"
+      }
+      show(f, label, s)
+    }
+    Err(e) => show_err(f, label, e)
+  }
+}
+
+test "openai-go's legacy completions: create and stream" {
+  let f = serve(os.net, "api.example.test")
+  let c = new_client(os.net, os.clock, os.rand, Options[()]{base_url: "https://api.example.test/v1/", api_key: "test-key", organization: "org-test", project: "proj-test"})
+  let none: List[(Str, Str)] = []
+
+  start(f, "l1")
+  on(f, "POST /v1/completions", [(200, none, LEGACY_RESP)])
+  show_completion(f, "legacy completion", c.completion(CompletionParams{
+    model: "gpt-3.5-turbo-instruct",
+    prompt: CompletionPrompt.Text("Hello"),
+    max_tokens: Some(4),
+    n: Some(2),
+    temperature: Some(0.0),
+    echo: Some(false),
+    seed: Some(7),
+    suffix: Some("!"),
+    logit_bias: [("50256", -100), ("1", 5)],
+    stop: Some(Stop.Many(["\n", "."])),
+  }))
+
+  start(f, "l2")
+  on(f, "POST /v1/completions", [(200, none, LEGACY_RESP)])
+  show_completion(f, "legacy completion prompts", c.completion(CompletionParams{model: "davinci-002", prompt: CompletionPrompt.Texts(["a", "b"]), stop: Some(Stop.One("END"))}))
+
+  start(f, "l3")
+  on(f, "POST /v1/completions", [sse_reply([legacy_chunk("Hel", ""), legacy_chunk("lo", ""), legacy_chunk("", "stop"), "{\"id\":\"cmpl-s\",\"object\":\"text_completion\",\"created\":1700000011,\"model\":\"gpt-3.5-turbo-instruct\",\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2,\"total_tokens\":3}}", "[DONE]"])])
+  match c.completion_stream(CompletionParams{model: "gpt-3.5-turbo-instruct", prompt: CompletionPrompt.Text("x"), include_usage: Some(true)}) {
+    Ok(st) => {
+      var n = 0
+      var text = ""
+      var err: OpenAIErr? = None
+      while {
+        match st.next() {
+          Ok(Some(ch)) => {
+            n = n + 1
+            let d = if ch.choices.is_empty() { "" } else { ch.choices[0].text }
+            let fin = if ch.choices.is_empty() { "" } else { ch.choices[0].finish_reason }
+            text = text + d
+            note(f, "l3: CHUNK ${n} text=${q(d)} finish=${q(fin)} usage=${ch.usage.total_tokens}")
+          }
+          Ok(None) => break
+          Err(e) => {
+            err = Some(e)
+            break
+          }
+        }
+      }
+      match err {
+        Some(e) => show_err(f, "legacy stream end", e)
+        None => show(f, "legacy stream end", "chunks=${n} text=${q(text)}")
+      }
+    }
+    Err(e) => show_err(f, "legacy stream end", e)
+  }
+
+  compare(f, ["l1", "l2", "l3"])
+}

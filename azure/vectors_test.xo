@@ -62,4 +62,8 @@ const GO_OPENAI_LINES: List[Str] = [
   "  H accept=application/octet-stream | api-key=az-key | content-type=application/json | user-agent=OpenAI/Xo 3.98.0 | x-stainless-arch=<x-stainless-arch> | x-stainless-lang=xo | x-stainless-os=<x-stainless-os> | x-stainless-package-version=3.98.0 | x-stainless-retry-count=0 | x-stainless-runtime-version=<x-stainless-runtime-version> | x-stainless-runtime=xo",
   "  B {\"input\":\"Hi\",\"model\":\"tts\",\"voice\":\"alloy\"}",
   "z8: azure speech: status=200 type=audio/mpeg bytes=494433",
+  "z9: REQ POST /openai/deployments/gpt-35-turbo-instruct/completions?api-version=2024-10-21",
+  "  H accept=application/json | api-key=az-key | content-type=application/json | user-agent=OpenAI/Xo 3.98.0 | x-stainless-arch=<x-stainless-arch> | x-stainless-lang=xo | x-stainless-os=<x-stainless-os> | x-stainless-package-version=3.98.0 | x-stainless-retry-count=0 | x-stainless-runtime-version=<x-stainless-runtime-version> | x-stainless-runtime=xo",
+  "  B {\"prompt\":\"Hello\",\"model\":\"gpt-35-turbo-instruct\"}",
+  "z9: azure legacy completion: id=cmpl-1 model=gpt-3.5-turbo-instruct object=text_completion created=1700000010 fp=fp_9 usage=2/4/6 [0 \" there.\" length] [1 \" world.\" stop]",
 ]
