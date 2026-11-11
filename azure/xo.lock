@@ -1,0 +1,9 @@
+# xo.lock: content hashes of the module versions this module builds with,
+# and the effects each module may reach (decision 0156).
+# Written by the xo toolchain (xo get, xo mod tidy, xo mod accept-effects); do not edit (core 4.3).
+github.com/xo-lang/azure v0.1.0 h1:1ALJcPpa1b2x0GgFur0/1zbrTQ9NrhFfckfaVQyed5Q=
+github.com/xo-lang/azure v0.1.0/xo.mod h1:nKIujQfs/w22JVYN59xBKLWTdkNSdw//tnC9yYuxABY=
+github.com/xo-lang/openai v0.1.0 h1:2ECmaeavVtd+uQasQPp66aHh/RMnG3k7O18+H2ZgDYo=
+github.com/xo-lang/openai v0.1.0/xo.mod h1:+x/tHmqd/eG/nLOrNGBh1YyGoIc/94GPsS4inpv7RS0=
+github.com/xo-lang/azure effects clock,net.dial,rand
+github.com/xo-lang/openai effects clock,env,net.dial,rand
