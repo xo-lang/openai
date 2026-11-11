@@ -78,9 +78,42 @@ here: any event whose JSON has an `error` field ends the stream with
 the data, an event not ended by a blank line is dropped, and a line may
 be 32 MiB.
 
+## Amendment 2 (2026-11-10): the Responses API
+
+Go's azopenai v0.9.0 examples call `Responses.New` seven times and
+`NewStreaming` and `Delete` once each, so the Responses API moves out of
+Deferred, as the subset those calls use (`responses.xo`):
+
+- `response` (POST responses), `response_stream` (the same with
+  `"stream": true`, through the root module's event reader) and
+  `delete_response` (DELETE responses/<id>, `Accept: */*`, the id
+  escaped as Go's FormatPath; an empty id is Go's `missing required
+  response_id parameter` before any request).
+- Parameters: the scalar options, include, metadata, service tier,
+  truncation, input as text or items (an input message with text and
+  image parts, a text message, a function call's output), reasoning
+  (effort, summary), tool choice (a mode or a function) and function
+  tools; anything else through `extra`. The body keeps Go's struct
+  order.
+- Results: the response with its output items (message parts with
+  annotations, function calls, reasoning summaries), usage with cached
+  and reasoning tokens, the error, `output_text()` as Go's OutputText,
+  and `raw` for the rest; stream events with their common fields and
+  `raw`. An `error` event is an ordinary event, as in Go (its JSON has
+  no top level `error` field); a `response.failed` event carries the
+  response's error.
+- The `azure` package routes `responses` to `/openai/responses`, not
+  the deployment path, as Go does.
+
+Still deferred from the Responses API: retrieve, cancel, input items,
+input tokens, compaction, the accumulator and the websocket transport,
+built in tools (file and web search, computer use, MCP, code
+interpreter) and structured output helpers. Vectors: sections p1 to
+p8 and z6 of the Go program.
+
 ## Deferred
 
-The Responses API (41k Go lines), assistants, threads and the other
+The rest of the Responses API (Amendment 2), assistants, threads and the other
 beta APIs, audio, images, files and uploads, batches, fine tuning,
 vector stores, moderation, models, containers, the admin APIs,
 realtime and websockets, webhooks, the Bedrock and other provider

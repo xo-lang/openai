@@ -86,18 +86,22 @@ fn chunk_of(v: json.Value) -> ChatChunk {
   }
 }
 
-/// A streamed chat completion (Go's ssestream.Stream[ChatCompletionChunk]):
-/// `next` gives each chunk, None at the end.
-pub struct ChatStream {
+/// Server-sent events (Go's ssestream.Stream): `next_value` gives each
+/// event's JSON, None at the end. Chat and response streams read through it.
+struct Events {
   s: http.ClientStream
   buf: Mutex[Str]
   done: Mutex[Bool]
 }
 
+fn events(s: http.ClientStream) -> Events {
+  Events{s: s, buf: Mutex.new(""), done: Mutex.new(false)}
+}
+
 /// The next line of the body without its `\n` (and a `\r` before it), as
 /// Go's bufio.ScanLines; None at the end (a last line without `\n`
 /// included).
-fn (st: ChatStream) line() -> Str? ! OpenAIErr uses net.dial {
+fn (st: Events) line() -> Str? ! OpenAIErr uses net.dial {
   while {
     let b = st.buf.with_read(fn(s: Str) -> Str { s })
     if let Some(i) = b.find("\n") {
@@ -125,7 +129,7 @@ fn (st: ChatStream) line() -> Str? ! OpenAIErr uses net.dial {
 /// Go's eventStreamDecoder.Next: the next event's data (each data line
 /// and a `\n`), None at the end (an event not ended by a blank line is
 /// dropped, as Go drops it).
-fn (st: ChatStream) event() -> Str? ! OpenAIErr uses net.dial {
+fn (st: Events) event() -> Str? ! OpenAIErr uses net.dial {
   var data = ""
   while {
     let l = st.line()? ?? return Ok(None)
@@ -143,9 +147,9 @@ fn (st: ChatStream) event() -> Str? ! OpenAIErr uses net.dial {
   }
 }
 
-/// The next chunk; None at `[DONE]` or the end. An event whose JSON has
-/// an `error` field ends the stream with Stream.
-pub fn (st: ChatStream) next() -> ChatChunk? ! OpenAIErr uses net.dial {
+/// The next event's JSON; None at `[DONE]` or the end. An event whose
+/// JSON has an `error` field ends the stream with Stream.
+fn (st: Events) next_value() -> json.Value? ! OpenAIErr uses net.dial {
   if st.done.with_read(fn(d: Bool) -> Bool { d }) {
     return Ok(None)
   }
@@ -179,13 +183,29 @@ pub fn (st: ChatStream) next() -> ChatChunk? ! OpenAIErr uses net.dial {
       other => other.encode()
     }))
   }
-  Ok(Some(chunk_of(v)))
+  Ok(Some(v))
+}
+
+fn (st: Events) close() {
+  st.done.reset(true)
+  st.s.close()
+}
+
+/// A streamed chat completion (Go's ssestream.Stream[ChatCompletionChunk]):
+/// `next` gives each chunk, None at the end.
+pub struct ChatStream {
+  e: Events
+}
+
+/// The next chunk; None at `[DONE]` or the end. An event whose JSON has
+/// an `error` field ends the stream with Stream.
+pub fn (st: ChatStream) next() -> ChatChunk? ! OpenAIErr uses net.dial {
+  Ok(st.e.next_value()?.map(chunk_of))
 }
 
 /// Releases the stream; reading after does nothing.
 pub fn (st: ChatStream) close() {
-  st.done.reset(true)
-  st.s.close()
+  st.e.close()
 }
 
 /// A call whose response body is a stream: the tries as `execute`, the
@@ -234,7 +254,7 @@ fn (c: Client[fx]) open(method: Str, path: Str, body: json.Value?, co: CallOptio
 /// Go's Chat.Completions.NewStreaming: the body with `"stream": true`.
 pub fn (c: Client[fx]) chat_completion_stream(p: ChatParams, co: CallOptions = CallOptions{}) -> ChatStream ! OpenAIErr uses (net.dial, clock, rand, fx) {
   let s = c.open("POST", "chat/completions", Some(p.to_json(stream: true)), co)?
-  Ok(ChatStream{s: s, buf: Mutex.new(""), done: Mutex.new(false)})
+  Ok(ChatStream{e: events(s)})
 }
 
 /// A tool call that just finished (Go's FinishedChatCompletionToolCall).

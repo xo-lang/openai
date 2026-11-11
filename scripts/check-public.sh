@@ -35,6 +35,8 @@ hits=$(echo "$files" | xargs grep -n -I -E '[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+\.[A-
 
 gl=${GITLEAKS_CONFIG:-../xo-publish-tools/gitleaks.toml}
 if [ -f "$gl" ]; then
+  # absolute, since the tree scan below runs from another directory
+  gl=$(cd "$(dirname "$gl")" && pwd)/$(basename "$gl")
   cfgdir=$(mktemp -d "${TMPDIR:-/tmp}/gitleaks-openai.XXXXXX")
   mkdir "$cfgdir/tree"
   git ls-files -co --exclude-standard | rsync -a --files-from=- . "$cfgdir/tree/"

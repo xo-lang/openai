@@ -33,4 +33,12 @@ const GO_OPENAI_LINES: List[Str] = [
   "  B {\"messages\":[{\"content\":\"Be brief.\",\"role\":\"system\"},{\"content\":\"Hi\",\"role\":\"user\"}],\"model\":\"gpt-4o\"}",
   "z5: azure token credential, 429 then 200: ok",
   "z4: azure http without unsafe: error: azure: authenticated requests require HTTPS; WithUnsafeAllowHTTP permits HTTP only for local development on loopback endpoints",
+  "z6: REQ POST /openai/responses?api-version=2025-04-01-preview",
+  "  H accept=application/json | api-key=az-key | content-type=application/json | user-agent=OpenAI/Xo 3.98.0 | x-stainless-arch=<x-stainless-arch> | x-stainless-lang=xo | x-stainless-os=<x-stainless-os> | x-stainless-package-version=3.98.0 | x-stainless-retry-count=0 | x-stainless-runtime-version=<x-stainless-runtime-version> | x-stainless-runtime=xo",
+  "  B {\"input\":\"Hi\",\"model\":\"gpt-4o\"}",
+  "z6: azure responses: id=resp_1 model=gpt-4o-2024-08-06 status=completed created=1741476542 prev=\"\" output_text=\"Forgetting is loss.\" items=message(msg_1 text=\"Forgetting \" annotations=0 text=\"is loss.\" annotations=0) usage=36/87/123 cached=4 reasoning=0",
+  "z6: REQ DELETE /openai/responses/resp_1?api-version=2025-04-01-preview",
+  "  H accept=*/* | api-key=az-key | user-agent=OpenAI/Xo 3.98.0 | x-stainless-arch=<x-stainless-arch> | x-stainless-lang=xo | x-stainless-os=<x-stainless-os> | x-stainless-package-version=3.98.0 | x-stainless-retry-count=0 | x-stainless-runtime-version=<x-stainless-runtime-version> | x-stainless-runtime=xo",
+  "  B ",
+  "z6: azure responses delete: ok",
 ]

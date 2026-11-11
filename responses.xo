@@ -1,0 +1,404 @@
+// The Responses API: create a response, stream one, delete one.
+//
+// Ported from github.com/openai/openai-go v3.98.0 (responses/response.go,
+// responses/response_helpers.go, shared/shared.go's ReasoningParam),
+// Copyright 2026 OpenAI, Apache License 2.0. Changed from the original:
+// rewritten in Xo; a subset of the parameters, input items and output
+// items (the rest through `extra` and `raw`); a pull reader in place of
+// Go's iterator (NOTICE.md).
+
+use std/json
+use std/url
+
+/// A part of an input message (Go's ResponseInputContentUnionParam).
+pub enum InputContent {
+  /// Go's ResponseInputTextParam.
+  Text(text: Str)
+  /// Go's ResponseInputImageParam: an image by URL (a data URL too) or by
+  /// file id; `detail` is "low", "high", "auto" or "" (omitted).
+  Image(image_url: Str?, file_id: Str?, detail: Str)
+}
+
+/// An input item (Go's ResponseInputItemUnionParam, the kinds the azopenai
+/// examples use).
+pub enum InputItem {
+  /// Go's ResponseInputItemMessageParam: a role ("user", "system",
+  /// "developer") and content parts.
+  Message(role: Str, content: List[InputContent])
+  /// Go's EasyInputMessageParam with text content: a role ("user",
+  /// "assistant", "system", "developer") and its text.
+  Text(role: Str, content: Str)
+  /// Go's ResponseInputItemFunctionCallOutputParam with text output: a
+  /// function's result for the call `call_id`.
+  FunctionCallOutput(call_id: Str, output: Str)
+}
+
+/// The input (Go's ResponseNewParamsInputUnion).
+pub enum Input {
+  Text(text: Str)
+  Items(items: List[InputItem])
+}
+
+/// A function the model may call (Go's FunctionToolParam).
+pub struct FunctionTool {
+  pub name: Str
+  pub description: Str? = None
+  /// The JSON Schema of its arguments; written with sorted keys, as Go
+  /// writes its map.
+  pub parameters: json.Value? = None
+  pub strict: Bool? = None
+}
+
+/// Go's ResponseNewParamsToolChoiceUnion: a mode ("none", "auto",
+/// "required") or one function.
+pub enum ResponseToolChoice {
+  Mode(mode: Str)
+  Function(name: Str)
+}
+
+/// Go's shared.ReasoningParam: effort ("minimal", "low", "medium",
+/// "high", ...) and summary ("auto", "concise", "detailed"); "" is
+/// omitted.
+pub struct Reasoning {
+  pub effort: Str = ""
+  pub summary: Str = ""
+}
+
+/// Go's ResponseNewParams (a subset; any other field through `extra`,
+/// Go's option.WithJSONSet).
+pub struct ResponseParams {
+  pub model: Str
+  pub input: Input? = None
+  pub background: Bool? = None
+  pub instructions: Str? = None
+  pub max_output_tokens: Int? = None
+  pub max_tool_calls: Int? = None
+  pub parallel_tool_calls: Bool? = None
+  pub previous_response_id: Str? = None
+  pub prompt_cache_key: Str? = None
+  pub safety_identifier: Str? = None
+  pub store: Bool? = None
+  pub temperature: Float? = None
+  pub top_logprobs: Int? = None
+  pub top_p: Float? = None
+  pub user: Str? = None
+  /// Go's ResponseIncludable values ("reasoning.encrypted_content", ...).
+  pub include: List[Str] = []
+  pub metadata: List[(Str, Str)] = []
+  pub service_tier: Str = ""
+  /// "auto" or "disabled"; "" is omitted.
+  pub truncation: Str = ""
+  pub reasoning: Reasoning? = None
+  pub tool_choice: ResponseToolChoice? = None
+  pub tools: List[FunctionTool] = []
+  pub extra: List[(Str, json.Value)] = []
+}
+
+fn content_json(c: InputContent) -> json.Value {
+  match c {
+    InputContent.Text(t) => json.Value.Object([("text", jstr(t)), ("type", jstr("input_text"))])
+    InputContent.Image(u, id, detail) => {
+      var f: List[(Str, json.Value)] = []
+      if detail != "" {
+        f.push(("detail", jstr(detail)))
+      }
+      f = f + opt_str("file_id", id) + opt_str("image_url", u)
+      f.push(("type", jstr("input_image")))
+      json.Value.Object(f)
+    }
+  }
+}
+
+fn item_json(i: InputItem) -> json.Value {
+  match i {
+    InputItem.Message(role, content) => json.Value.Object([("content", json.Value.List(content.map(content_json))), ("role", jstr(role))])
+    InputItem.Text(role, content) => json.Value.Object([("content", jstr(content)), ("role", jstr(role))])
+    InputItem.FunctionCallOutput(id, out) => json.Value.Object([("output", jstr(out)), ("call_id", jstr(id)), ("type", jstr("function_call_output"))])
+  }
+}
+
+fn function_tool_json(t: FunctionTool) -> json.Value {
+  var f = opt_boo("strict", t.strict)
+  if let Some(p) = t.parameters {
+    f.push(("parameters", sorted(p)))
+  }
+  f.push(("name", jstr(t.name)))
+  f = f + opt_str("description", t.description)
+  f.push(("type", jstr("function")))
+  json.Value.Object(f)
+}
+
+fn opt_nonempty(k: Str, v: Str) -> List[(Str, json.Value)] {
+  if v == "" { [] } else { [(k, jstr(v))] }
+}
+
+/// The request body in Go's field order; `stream` adds Go's
+/// `"stream": true` last.
+pub fn (p: ResponseParams) to_json(stream: Bool = false) -> json.Value {
+  var f = opt_boo("background", p.background)
+  f = f + opt_str("instructions", p.instructions)
+  f = f + opt_int("max_output_tokens", p.max_output_tokens)
+  f = f + opt_int("max_tool_calls", p.max_tool_calls)
+  f = f + opt_boo("parallel_tool_calls", p.parallel_tool_calls)
+  f = f + opt_str("previous_response_id", p.previous_response_id)
+  f = f + opt_str("prompt_cache_key", p.prompt_cache_key)
+  f = f + opt_str("safety_identifier", p.safety_identifier)
+  f = f + opt_boo("store", p.store)
+  f = f + opt_num("temperature", p.temperature)
+  f = f + opt_int("top_logprobs", p.top_logprobs)
+  f = f + opt_num("top_p", p.top_p)
+  f = f + opt_str("user", p.user)
+  if !p.include.is_empty() {
+    f.push(("include", json.Value.List(p.include.map(jstr))))
+  }
+  if !p.metadata.is_empty() {
+    f.push(("metadata", sorted(json.Value.Object(p.metadata.map(fn(x: (Str, Str)) -> (Str, json.Value) { (x.0, jstr(x.1)) })))))
+  }
+  f = f + opt_nonempty("service_tier", p.service_tier)
+  f = f + opt_nonempty("truncation", p.truncation)
+  if let Some(i) = p.input {
+    f.push(("input", match i {
+      Input.Text(t) => jstr(t)
+      Input.Items(xs) => json.Value.List(xs.map(item_json))
+    }))
+  }
+  f = f + opt_nonempty("model", p.model)
+  if let Some(r) = p.reasoning {
+    let rf = opt_nonempty("effort", r.effort) + opt_nonempty("summary", r.summary)
+    if !rf.is_empty() {
+      f.push(("reasoning", json.Value.Object(rf)))
+    }
+  }
+  if let Some(tc) = p.tool_choice {
+    f.push(("tool_choice", match tc {
+      ResponseToolChoice.Mode(m) => jstr(m)
+      ResponseToolChoice.Function(name) => json.Value.Object([("name", jstr(name)), ("type", jstr("function"))])
+    }))
+  }
+  if !p.tools.is_empty() {
+    f.push(("tools", json.Value.List(p.tools.map(function_tool_json))))
+  }
+  for x in p.extra {
+    f.push(x)
+  }
+  if stream {
+    f.push(("stream", json.Value.Bool(true)))
+  }
+  json.Value.Object(f)
+}
+
+/// An annotation of output text (Go's ResponseOutputTextAnnotationUnion:
+/// its common fields; `raw` for the rest).
+pub struct Annotation {
+  pub kind: Str = ""
+  pub start_index: Int = 0
+  pub end_index: Int = 0
+  pub url: Str = ""
+  pub title: Str = ""
+  pub file_id: Str = ""
+  pub raw: json.Value = json.Value.Null
+}
+
+/// A part of an output message (Go's ResponseOutputMessageContentUnion):
+/// `kind` "output_text" with text and annotations, or "refusal".
+pub struct OutputContent {
+  pub kind: Str = ""
+  pub text: Str = ""
+  pub refusal: Str = ""
+  pub annotations: List[Annotation] = []
+}
+
+/// An output item (Go's ResponseOutputItemUnion): `kind` "message" (role,
+/// content), "function_call" (call_id, name, arguments), "reasoning"
+/// (summary texts), or another kind, read from `raw`.
+pub struct OutputItem {
+  pub kind: Str = ""
+  pub id: Str = ""
+  pub status: Str = ""
+  pub role: Str = ""
+  pub content: List[OutputContent] = []
+  pub call_id: Str = ""
+  pub name: Str = ""
+  /// The arguments as the model wrote them, JSON text.
+  pub arguments: Str = ""
+  pub summary: List[Str] = []
+  pub raw: json.Value = json.Value.Null
+}
+
+/// Go's ResponseUsage with its details' counts.
+pub struct ResponseUsage {
+  pub input_tokens: Int = 0
+  pub cached_tokens: Int = 0
+  pub output_tokens: Int = 0
+  pub reasoning_tokens: Int = 0
+  pub total_tokens: Int = 0
+}
+
+/// Go's ResponseError: why a response failed.
+pub struct ResponseError {
+  pub code: Str = ""
+  pub message: Str = ""
+}
+
+/// Go's Response; `raw` is the whole response for any other field.
+pub struct Response {
+  pub id: Str = ""
+  pub object: Str = ""
+  pub created_at: Int = 0
+  pub status: Str = ""
+  pub model: Str = ""
+  pub instructions: Str = ""
+  pub previous_response_id: Str = ""
+  pub error: ResponseError = ResponseError{}
+  pub output: List[OutputItem] = []
+  pub usage: ResponseUsage = ResponseUsage{}
+  pub raw: json.Value = json.Value.Null
+}
+
+/// Go's Response.OutputText: the text of every output_text part, joined.
+pub fn (r: Response) output_text() -> Str {
+  var s = ""
+  for o in r.output {
+    for c in o.content {
+      if c.kind == "output_text" {
+        s = s + c.text
+      }
+    }
+  }
+  s
+}
+
+fn obj_of(v: json.Value, k: Str) -> json.Value {
+  v.get(k) ?? json.Value.Null
+}
+
+fn annotation_of(a: json.Value) -> Annotation {
+  Annotation{kind: str_of(a, "type"), start_index: int_of(a, "start_index"), end_index: int_of(a, "end_index"), url: str_of(a, "url"), title: str_of(a, "title"), file_id: str_of(a, "file_id"), raw: a}
+}
+
+fn output_item_of(o: json.Value) -> OutputItem {
+  OutputItem{
+    kind: str_of(o, "type"),
+    id: str_of(o, "id"),
+    status: str_of(o, "status"),
+    role: str_of(o, "role"),
+    content: list_of(o, "content").map(fn(c: json.Value) -> OutputContent {
+      OutputContent{kind: str_of(c, "type"), text: str_of(c, "text"), refusal: str_of(c, "refusal"), annotations: list_of(c, "annotations").map(annotation_of)}
+    }),
+    call_id: str_of(o, "call_id"),
+    name: str_of(o, "name"),
+    arguments: str_of(o, "arguments"),
+    summary: list_of(o, "summary").map(fn(x: json.Value) -> Str { str_of(x, "text") }),
+    raw: o,
+  }
+}
+
+fn response_of(v: json.Value) -> Response {
+  let u = obj_of(v, "usage")
+  let e = obj_of(v, "error")
+  Response{
+    id: str_of(v, "id"),
+    object: str_of(v, "object"),
+    created_at: int_of(v, "created_at"),
+    status: str_of(v, "status"),
+    model: str_of(v, "model"),
+    instructions: str_of(v, "instructions"),
+    previous_response_id: str_of(v, "previous_response_id"),
+    error: ResponseError{code: str_of(e, "code"), message: str_of(e, "message")},
+    output: list_of(v, "output").map(output_item_of),
+    usage: ResponseUsage{
+      input_tokens: int_of(u, "input_tokens"),
+      cached_tokens: int_of(obj_of(u, "input_tokens_details"), "cached_tokens"),
+      output_tokens: int_of(u, "output_tokens"),
+      reasoning_tokens: int_of(obj_of(u, "output_tokens_details"), "reasoning_tokens"),
+      total_tokens: int_of(u, "total_tokens"),
+    },
+    raw: v,
+  }
+}
+
+/// Go's Responses.New: POST responses.
+pub fn (c: Client[fx]) response(p: ResponseParams, co: CallOptions = CallOptions{}) -> Response ! OpenAIErr uses (net.dial, clock, rand, fx) {
+  Ok(response_of(c.call_json("POST", "responses", Some(p.to_json()), co)?))
+}
+
+/// Go's Responses.Delete: DELETE responses/<id>, with `Accept: */*` (a
+/// call option's Accept wins).
+pub fn (c: Client[fx]) delete_response(id: Str, co: CallOptions = CallOptions{}) -> () ! OpenAIErr uses (net.dial, clock, rand, fx) {
+  if id == "" {
+    return Err(OpenAIErr.Request("missing required response_id parameter"))
+  }
+  let o = CallOptions{max_retries: co.max_retries, headers: [("Accept", "*/*")] + co.headers, query: co.query}
+  c.execute("DELETE", "responses/${path_param(id)}", None, o)?
+  Ok(())
+}
+
+/// Go's requestconfig.FormatPath for one parameter: `.` and `..` escaped,
+/// else url.PathEscape.
+fn path_param(s: Str) -> Str {
+  match s {
+    "." => "%2E"
+    ".." => "%2E%2E"
+    _ => url.path_escape(s)
+  }
+}
+
+/// An event of a streamed response (Go's ResponseStreamEventUnion: its
+/// common fields; `raw` for the rest). `kind` is the event's type, as
+/// "response.output_text.delta"; `item` is set for the output_item
+/// events, `response` for response.created, .completed, .failed and the
+/// others that carry one; `code` and `message` for "error".
+pub struct ResponseEvent {
+  pub kind: Str = ""
+  pub sequence_number: Int = 0
+  pub item_id: Str = ""
+  pub output_index: Int = 0
+  pub content_index: Int = 0
+  pub delta: Str = ""
+  pub text: Str = ""
+  pub item: OutputItem = OutputItem{}
+  pub response: Response = Response{}
+  pub code: Str = ""
+  pub message: Str = ""
+  pub raw: json.Value = json.Value.Null
+}
+
+fn event_of(v: json.Value) -> ResponseEvent {
+  ResponseEvent{
+    kind: str_of(v, "type"),
+    sequence_number: int_of(v, "sequence_number"),
+    item_id: str_of(v, "item_id"),
+    output_index: int_of(v, "output_index"),
+    content_index: int_of(v, "content_index"),
+    delta: str_of(v, "delta"),
+    text: str_of(v, "text"),
+    item: output_item_of(obj_of(v, "item")),
+    response: response_of(obj_of(v, "response")),
+    code: str_of(v, "code"),
+    message: str_of(v, "message"),
+    raw: v,
+  }
+}
+
+/// A streamed response (Go's ssestream.Stream[ResponseStreamEventUnion]):
+/// `next` gives each event, None at the end. An "error" event is an event
+/// as Go reads it (its JSON has no `error` field); an event whose JSON
+/// has one ends the stream with Stream.
+pub struct ResponseStream {
+  e: Events
+}
+
+pub fn (st: ResponseStream) next() -> ResponseEvent? ! OpenAIErr uses net.dial {
+  Ok(st.e.next_value()?.map(event_of))
+}
+
+/// Releases the stream; reading after does nothing.
+pub fn (st: ResponseStream) close() {
+  st.e.close()
+}
+
+/// Go's Responses.NewStreaming: the body with `"stream": true`.
+pub fn (c: Client[fx]) response_stream(p: ResponseParams, co: CallOptions = CallOptions{}) -> ResponseStream ! OpenAIErr uses (net.dial, clock, rand, fx) {
+  let s = c.open("POST", "responses", Some(p.to_json(stream: true)), co)?
+  Ok(ResponseStream{e: events(s)})
+}

@@ -1,4 +1,4 @@
-// Replays the Go program's Azure calls (z1 to z5, vectors_test.xo)
+// Replays the Go program's Azure calls (z1 to z6, vectors_test.xo)
 // against the same fake: a loopback http host, a credential that counts
 // its tokens.
 
@@ -79,6 +79,7 @@ fn serve(net: testing.FakeNet, host: Str) -> Fake {
   let h = fn(req: http.Request) -> http.Response { answer(f, req) }
   net.handle("POST ${host}/{rest...}", h)
   net.handle("GET ${host}/{rest...}", h)
+  net.handle("DELETE ${host}/{rest...}", h)
   f
 }
 
@@ -200,5 +201,34 @@ test "openai-go's azure package: endpoint, api key, token credential, plain http
   let azh = openai.new_client(os.net, os.clock, os.rand, options(AzureOptions[()]{endpoint: "http://localhost", api_version: "2024-10-21", api_key: "az-key"}))
   ok("azure http without unsafe", azh.chat_completion(base).map(fn(_: openai.ChatCompletion) {}))
 
-  compare(f, ["z1", "z2", "z3", "z5", "z4"])
+  start(f, "z6")
+  on(f, "POST /openai/responses", [(200, none, RESP_TEXT)])
+  on(f, "POST /openai/deployments/gpt-4o/responses", [(200, none, RESP_TEXT)])
+  on(f, "POST /openai/v1/responses", [(200, none, RESP_TEXT)])
+  let azr = openai.new_client(os.net, os.clock, os.rand, options(AzureOptions[()]{endpoint: "http://localhost", api_version: "2025-04-01-preview", api_key: "az-key", unsafe_allow_http: true}))
+  match azr.response(openai.ResponseParams{model: "gpt-4o", input: Some(openai.Input.Text("Hi"))}) {
+    Ok(r) => show(f, "azure responses", response_line(r))
+    Err(e) => show_err(f, "azure responses", e)
+  }
+  on(f, "DELETE /openai/responses/resp_1", [(200, none, "")])
+  on(f, "DELETE /openai/v1/responses/resp_1", [(200, none, "")])
+  ok("azure responses delete", azr.delete_response("resp_1"))
+
+  compare(f, ["z1", "z2", "z3", "z5", "z4", "z6"])
+}
+
+const RESP_TEXT: Str = "{\"id\":\"resp_1\",\"object\":\"response\",\"created_at\":1741476542,\"status\":\"completed\",\"model\":\"gpt-4o-2024-08-06\",\"output\":[{\"type\":\"message\",\"id\":\"msg_1\",\"status\":\"completed\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Forgetting \",\"annotations\":[]},{\"type\":\"output_text\",\"text\":\"is loss.\",\"annotations\":[]}]}],\"usage\":{\"input_tokens\":36,\"input_tokens_details\":{\"cached_tokens\":4},\"output_tokens\":87,\"output_tokens_details\":{\"reasoning_tokens\":0},\"total_tokens\":123}}"
+
+/// The Go program's showResponse line, for a response with message items.
+fn response_line(r: openai.Response) -> Str {
+  var items: List[Str] = []
+  for o in r.output {
+    var s = "${o.kind}(${o.id}"
+    for c in o.content {
+      s = s + " text=${q(c.text)} annotations=${c.annotations.len()}"
+    }
+    items.push(s + ")")
+  }
+  let u = r.usage
+  "id=${r.id} model=${r.model} status=${r.status} created=${r.created_at} prev=${q(r.previous_response_id)} output_text=${q(r.output_text())} items=${items.join(" ")} usage=${u.input_tokens}/${u.output_tokens}/${u.total_tokens} cached=${u.cached_tokens} reasoning=${u.reasoning_tokens}"
 }

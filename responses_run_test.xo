@@ -1,0 +1,211 @@
+// Replays the Go program's Responses API calls (sections p1 to p8 of
+// vectors_test.xo) against the same fake, printing each result as the Go
+// program prints it.
+
+use std/json
+
+const RESP_TEXT: Str = "{\"id\":\"resp_1\",\"object\":\"response\",\"created_at\":1741476542,\"status\":\"completed\",\"error\":null,\"incomplete_details\":null,\"instructions\":\"Be brief.\",\"max_output_tokens\":50,\"model\":\"gpt-4o-2024-08-06\",\"output\":[{\"type\":\"message\",\"id\":\"msg_1\",\"status\":\"completed\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Forgetting \",\"annotations\":[]},{\"type\":\"output_text\",\"text\":\"is loss.\",\"annotations\":[]}]}],\"parallel_tool_calls\":true,\"previous_response_id\":null,\"temperature\":0.5,\"tool_choice\":\"auto\",\"tools\":[],\"top_p\":1,\"usage\":{\"input_tokens\":36,\"input_tokens_details\":{\"cached_tokens\":4},\"output_tokens\":87,\"output_tokens_details\":{\"reasoning_tokens\":0},\"total_tokens\":123},\"metadata\":{}}"
+
+const RESP_REASON: Str = "{\"id\":\"resp_2\",\"object\":\"response\",\"created_at\":1741476543,\"status\":\"completed\",\"model\":\"o4-mini\",\"output\":[{\"type\":\"reasoning\",\"id\":\"rs_1\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"Divide 450 by 120.\"}]},{\"type\":\"message\",\"id\":\"msg_2\",\"status\":\"completed\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"3.75 hours.\",\"annotations\":[{\"type\":\"url_citation\",\"start_index\":0,\"end_index\":4,\"url\":\"https://example.test/a\",\"title\":\"A\"}]}]}],\"previous_response_id\":\"resp_1\",\"usage\":{\"input_tokens\":10,\"input_tokens_details\":{\"cached_tokens\":0},\"output_tokens\":20,\"output_tokens_details\":{\"reasoning_tokens\":12},\"total_tokens\":30}}"
+
+const RESP_CALL: Str = "{\"id\":\"resp_3\",\"object\":\"response\",\"created_at\":1741476544,\"status\":\"completed\",\"model\":\"gpt-4o\",\"output\":[{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_7\",\"name\":\"get_weather\",\"arguments\":\"{\\\"location\\\":\\\"San Francisco\\\"}\",\"status\":\"completed\"}],\"usage\":{\"input_tokens\":5,\"output_tokens\":6,\"total_tokens\":11}}"
+
+const RESP_AFTER_CALL: Str = "{\"id\":\"resp_4\",\"object\":\"response\",\"created_at\":1741476545,\"status\":\"completed\",\"model\":\"gpt-4o\",\"output\":[{\"type\":\"message\",\"id\":\"msg_4\",\"status\":\"completed\",\"role\":\"assistant\",\"content\":[{\"type\":\"refusal\",\"refusal\":\"No.\"},{\"type\":\"output_text\",\"text\":\"It is sunny.\",\"annotations\":[]}]}],\"previous_response_id\":\"resp_3\",\"usage\":{\"input_tokens\":7,\"output_tokens\":4,\"total_tokens\":11}}"
+
+/// The Go program's showResponse line for a response.
+fn response_line(r: Response) -> Str {
+  var items: List[Str] = []
+  for o in r.output {
+    var s = "${o.kind}(${o.id}"
+    if o.kind == "message" {
+      for c in o.content {
+        if c.kind == "output_text" {
+          s = s + " text=${q(c.text)} annotations=${c.annotations.len()}"
+          for a in c.annotations {
+            s = s + " [${a.kind} ${a.start_index}-${a.end_index} ${a.url} ${q(a.title)}]"
+          }
+        } else {
+          s = s + " ${c.kind}=${q(c.refusal)}"
+        }
+      }
+    } else if o.kind == "function_call" {
+      s = s + " call=${o.call_id} name=${o.name} args=${o.arguments} status=${o.status}"
+    } else if o.kind == "reasoning" {
+      for x in o.summary {
+        s = s + " summary=${q(x)}"
+      }
+    }
+    items.push(s + ")")
+  }
+  let u = r.usage
+  "id=${r.id} model=${r.model} status=${r.status} created=${r.created_at} prev=${q(r.previous_response_id)} output_text=${q(r.output_text())} items=${items.join(" ")} usage=${u.input_tokens}/${u.output_tokens}/${u.total_tokens} cached=${u.cached_tokens} reasoning=${u.reasoning_tokens}"
+}
+
+fn show_response(f: Fake, label: Str, r: Result[Response, OpenAIErr]) {
+  match r {
+    Ok(x) => show(f, label, response_line(x))
+    Err(e) => show_err(f, label, e)
+  }
+}
+
+fn show_unit(f: Fake, label: Str, r: Result[(), OpenAIErr]) {
+  match r {
+    Ok(_) => show(f, label, "ok")
+    Err(e) => show_err(f, label, e)
+  }
+}
+
+fn ev(kind: Str, rest: Str) -> Str {
+  "{\"type\":\"${kind}\"${if rest == "" { "" } else { ",${rest}" }}}"
+}
+
+fn sse_reply(events: List[Str]) -> (Int, List[(Str, Str)], Str) {
+  (200, [("content-type", "text/event-stream")], events.map(fn(e: Str) -> Str { "data: ${e}\n\n" }).join(""))
+}
+
+fn weather_fn() -> FunctionTool {
+  FunctionTool{
+    name: "get_weather",
+    description: Some("Get the weather for a location"),
+    parameters: Some(json.Value.Object([("type", json.Value.Str("object")), ("properties", json.Value.Object([("location", json.Value.Object([("type", json.Value.Str("string"))]))])), ("required", json.Value.List([json.Value.Str("location")]))])),
+    strict: Some(true),
+  }
+}
+
+test "openai-go's Responses API: create, stream, delete" {
+  let f = serve(os.net, "api.example.test")
+  let c = new_client(os.net, os.clock, os.rand, Options[()]{base_url: "https://api.example.test/v1/", api_key: "test-key", organization: "org-test", project: "proj-test"})
+  let none: List[(Str, Str)] = []
+
+  start(f, "p1")
+  on(f, "POST /v1/responses", [(200, none, RESP_TEXT)])
+  show_response(f, "responses text", c.response(ResponseParams{
+    model: "gpt-4o",
+    input: Some(Input.Text("Define catastrophic forgetting.")),
+    instructions: Some("Be brief."),
+    max_output_tokens: Some(50),
+    temperature: Some(0.5),
+    store: Some(false),
+    metadata: [("run", "p1")],
+  }))
+
+  start(f, "p2")
+  on(f, "POST /v1/responses", [(200, none, RESP_REASON)])
+  show_response(f, "responses items and reasoning", c.response(ResponseParams{
+    model: "o4-mini",
+    previous_response_id: Some("resp_1"),
+    input: Some(Input.Items([InputItem.Message(role: "user", content: [
+      InputContent.Text("What is in this image?"),
+      InputContent.Image(image_url: Some("data:image/png;base64,AAAA"), file_id: None, detail: "low"),
+    ])])),
+    reasoning: Some(Reasoning{effort: "medium", summary: "auto"}),
+  }))
+
+  start(f, "p3")
+  on(f, "POST /v1/responses", [(200, none, RESP_CALL), (200, none, RESP_AFTER_CALL)])
+  let first = c.response(ResponseParams{
+    model: "gpt-4o",
+    input: Some(Input.Text("What's the weather in San Francisco?")),
+    tools: [weather_fn()],
+    tool_choice: Some(ResponseToolChoice.Mode("required")),
+  })
+  show_response(f, "responses function call", first)
+  if let Ok(r) = first {
+    show_response(f, "responses function output", c.response(ResponseParams{
+      model: "gpt-4o",
+      previous_response_id: Some(r.id),
+      input: Some(Input.Items([InputItem.FunctionCallOutput(call_id: "call_7", output: "{\"temperature\": \"72 degrees\"}")])),
+      tools: [weather_fn()],
+    }))
+  }
+
+  start(f, "p4")
+  on(f, "POST /v1/responses", [sse_reply([
+    ev("response.created", "\"sequence_number\":0,\"response\":{\"id\":\"resp_s\",\"object\":\"response\",\"created_at\":1741476546,\"status\":\"in_progress\",\"model\":\"gpt-4o\",\"output\":[]}"),
+    ev("response.output_item.added", "\"sequence_number\":1,\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_s\",\"status\":\"in_progress\",\"role\":\"assistant\",\"content\":[]}"),
+    ev("response.content_part.added", "\"sequence_number\":2,\"item_id\":\"msg_s\",\"output_index\":0,\"content_index\":0,\"part\":{\"type\":\"output_text\",\"text\":\"\",\"annotations\":[]}"),
+    ev("response.output_text.delta", "\"sequence_number\":3,\"item_id\":\"msg_s\",\"output_index\":0,\"content_index\":0,\"delta\":\"This is \""),
+    ev("response.output_text.delta", "\"sequence_number\":4,\"item_id\":\"msg_s\",\"output_index\":0,\"content_index\":0,\"delta\":\"a test.\""),
+    ev("response.output_text.done", "\"sequence_number\":5,\"item_id\":\"msg_s\",\"output_index\":0,\"content_index\":0,\"text\":\"This is a test.\""),
+    ev("response.output_item.done", "\"sequence_number\":6,\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_s\",\"status\":\"completed\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"This is a test.\",\"annotations\":[]}]}"),
+    ev("response.completed", "\"sequence_number\":7,\"response\":{\"id\":\"resp_s\",\"object\":\"response\",\"created_at\":1741476546,\"status\":\"completed\",\"model\":\"gpt-4o\",\"output\":[{\"type\":\"message\",\"id\":\"msg_s\",\"status\":\"completed\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"This is a test.\",\"annotations\":[]}]}],\"usage\":{\"input_tokens\":3,\"output_tokens\":5,\"total_tokens\":8}}"),
+  ])])
+  match c.response_stream(ResponseParams{model: "gpt-4o", input: Some(Input.Text("This is a test"))}) {
+    Ok(st) => {
+      var n = 0
+      var text = ""
+      var final = ""
+      var err: OpenAIErr? = None
+      while {
+        match st.next() {
+          Ok(Some(e)) => {
+            n = n + 1
+            note(f, "p4: EVENT ${n} ${e.kind} seq=${e.sequence_number} item=${q(e.item_id)} out=${e.output_index} content=${e.content_index} delta=${q(e.delta)} text=${q(e.text)} itemtype=${q(e.item.kind)} resp=${q(e.response.id)}")
+            if e.kind == "response.output_text.delta" {
+              text = text + e.delta
+            }
+            if e.kind == "response.completed" {
+              final = e.response.output_text()
+            }
+          }
+          Ok(None) => break
+          Err(e) => {
+            err = Some(e)
+            break
+          }
+        }
+      }
+      match err {
+        Some(e) => show_err(f, "responses stream end", e)
+        None => show(f, "responses stream end", "events=${n} text=${q(text)} final=${q(final)}")
+      }
+    }
+    Err(e) => show_err(f, "responses stream end", e)
+  }
+
+  start(f, "p5")
+  on(f, "POST /v1/responses", [sse_reply([
+    ev("response.output_text.delta", "\"sequence_number\":0,\"item_id\":\"m\",\"output_index\":0,\"content_index\":0,\"delta\":\"x\""),
+    ev("error", "\"sequence_number\":1,\"code\":\"server_error\",\"message\":\"overloaded\",\"param\":null"),
+    ev("response.failed", "\"sequence_number\":2,\"response\":{\"id\":\"resp_f\",\"object\":\"response\",\"created_at\":1,\"status\":\"failed\",\"model\":\"gpt-4o\",\"output\":[],\"error\":{\"code\":\"server_error\",\"message\":\"overloaded\"}}"),
+  ])])
+  match c.response_stream(ResponseParams{model: "gpt-4o", input: Some(Input.Text("x"))}) {
+    Ok(st) => {
+      var n = 0
+      var err: OpenAIErr? = None
+      while {
+        match st.next() {
+          Ok(Some(e)) => {
+            n = n + 1
+            note(f, "p5: EVENT ${n} ${e.kind} code=${q(e.code)} message=${q(e.message)} resp_status=${q(e.response.status)} resp_error=${q(e.response.error.message)}")
+          }
+          Ok(None) => break
+          Err(e) => {
+            err = Some(e)
+            break
+          }
+        }
+      }
+      match err {
+        Some(e) => show_err(f, "responses stream error event", e)
+        None => show(f, "responses stream error event", "events=${n}")
+      }
+    }
+    Err(e) => show_err(f, "responses stream error event", e)
+  }
+
+  start(f, "p6")
+  on(f, "DELETE /v1/responses/resp_1", [(200, none, "")])
+  show_unit(f, "responses delete", c.delete_response("resp_1"))
+
+  start(f, "p7")
+  on(f, "DELETE /v1/responses/resp_x", [(404, none, "{\"error\":{\"message\":\"Response with id 'resp_x' not found.\",\"type\":\"invalid_request_error\",\"param\":null,\"code\":null}}")])
+  show_unit(f, "responses delete missing", c.delete_response("resp_x"))
+  show_unit(f, "responses delete empty id", c.delete_response(""))
+
+  start(f, "p8")
+  on(f, "POST /v1/responses", [(200, none, RESP_TEXT)])
+  show_response(f, "responses minimal", c.response(ResponseParams{model: "gpt-4o", input: Some(Input.Text("Hi"))}, CallOptions{max_retries: Some(0)}))
+
+  compare(f, ["p1", "p2", "p3", "p4", "p5", "p6", "p7", "p8"])
+}
