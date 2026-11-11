@@ -37,9 +37,14 @@ fn opt_form_int(k: Str, v: Int?) -> List[(Str, FormValue)] {
 
 fn opt_form_num(k: Str, v: Float?) -> List[(Str, FormValue)] {
   match v {
-    Some(x) => [(k, FormValue.Text(x.to_general(-1)))]
+    Some(x) => [(k, FormValue.Text(x.to_fixed(-1)))]
     None => []
   }
+}
+
+/// A list field as Go's apiform writes one: `name[]` for each value.
+fn form_list(k: Str, vs: List[Str]) -> List[(Str, FormValue)] {
+  vs.map(fn(v: Str) -> (Str, FormValue) { ("${k}[]", FormValue.Text(v)) })
 }
 
 fn form_nonempty(k: Str, v: Str) -> List[(Str, FormValue)] {

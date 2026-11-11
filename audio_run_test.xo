@@ -1,0 +1,50 @@
+// Replays the Go program's audio calls (sections a1 to a5 of
+// vectors_test.xo) against the same fake.
+
+fn wav() -> FileUpload {
+  FileUpload{data: b"RIFFWAVE", filename: "hello.wav", content_type: "audio/wav"}
+}
+
+fn show_speech(f: Fake, label: Str, r: Result[Speech, OpenAIErr]) {
+  match r {
+    Ok(s) => show(f, label, "status=${s.status} type=${s.content_type} bytes=${s.data.to_hex()}")
+    Err(e) => show_err(f, label, e)
+  }
+}
+
+test "openai-go's audio: transcriptions, translations, speech" {
+  let f = serve(os.net, "api.example.test")
+  let c = new_client(os.net, os.clock, os.rand, Options[()]{base_url: "https://api.example.test/v1/", api_key: "test-key", organization: "org-test", project: "proj-test"})
+  let none: List[(Str, Str)] = []
+
+  start(f, "a1")
+  on(f, "POST /v1/audio/transcriptions", [(200, none, "{\"text\":\"Hello there.\",\"logprobs\":[{\"token\":\"Hello\",\"logprob\":-0.1,\"bytes\":[72]}],\"usage\":{\"type\":\"tokens\",\"input_tokens\":14,\"output_tokens\":5,\"total_tokens\":19,\"input_token_details\":{\"audio_tokens\":14,\"text_tokens\":0}}}")])
+  match c.transcribe(TranscriptionParams{file: wav(), model: "gpt-4o-transcribe", language: Some("en"), prompt: Some("A greeting."), temperature: Some(0.2), response_format: "json", include: ["logprobs"], timestamp_granularities: ["word", "segment"]}) {
+    Ok(t) => show(f, "transcription", "text=${q(t.text)} usage=${t.usage.kind}/${t.usage.input_tokens}/${t.usage.output_tokens}/${t.usage.total_tokens}")
+    Err(e) => show_err(f, "transcription", e)
+  }
+
+  start(f, "a2")
+  on(f, "POST /v1/audio/transcriptions", [(200, none, "{\"task\":\"transcribe\",\"language\":\"english\",\"duration\":1.5,\"text\":\"Hi.\",\"segments\":[{\"id\":0,\"start\":0,\"end\":1.5,\"text\":\"Hi.\"}],\"usage\":{\"type\":\"duration\",\"seconds\":2}}")])
+  match c.transcribe(TranscriptionParams{file: FileUpload{data: b"RAW"}, model: "whisper-1", response_format: "verbose_json"}) {
+    Ok(t) => show(f, "transcription verbose", "text=${q(t.text)} language=${t.language} duration=${gofloat(t.duration)} segments=${t.segments.len()} usage=${t.usage.kind}/${gofloat(t.usage.seconds)}")
+    Err(e) => show_err(f, "transcription verbose", e)
+  }
+
+  start(f, "a3")
+  on(f, "POST /v1/audio/translations", [(200, none, "{\"text\":\"Good morning.\"}")])
+  match c.translate(TranslationParams{file: wav(), model: "whisper-1", prompt: Some("p"), temperature: Some(0.0)}) {
+    Ok(t) => show(f, "translation", "text=${q(t)}")
+    Err(e) => show_err(f, "translation", e)
+  }
+
+  start(f, "a4")
+  on(f, "POST /v1/audio/speech", [(200, [("content-type", "audio/flac")], "fLaC\u{0}\u{1}\u{7f}")])
+  show_speech(f, "speech", c.speech(SpeechParams{input: "Hello.", model: "gpt-4o-mini-tts", voice: "alloy", instructions: Some("Cheerful."), speed: Some(1.25), response_format: "flac"}))
+
+  start(f, "a5")
+  on(f, "POST /v1/audio/speech", [(400, none, "{\"error\":{\"message\":\"Invalid voice.\",\"type\":\"invalid_request_error\",\"param\":\"voice\",\"code\":null}}")])
+  show_speech(f, "speech error", c.speech(SpeechParams{input: "x", model: "tts-1", voice: "nobody"}))
+
+  compare(f, ["a1", "a2", "a3", "a4", "a5"])
+}

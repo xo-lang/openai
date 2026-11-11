@@ -1,4 +1,4 @@
-// Replays the Go program's Azure calls (z1 to z7, vectors_test.xo)
+// Replays the Go program's Azure calls (z1 to z8, vectors_test.xo)
 // against the same fake: a loopback http host, a credential that counts
 // its tokens.
 
@@ -241,7 +241,25 @@ test "openai-go's azure package: endpoint, api key, token credential, plain http
   img("azure images edit", azr.edit_images(openai.ImageEditParams{image: openai.ImageInput.One(cat), prompt: "add a hat", model: "gpt-image-1"}))
   img("azure images edit without model", azr.edit_images(openai.ImageEditParams{image: openai.ImageInput.One(cat), prompt: "no model"}))
 
-  compare(f, ["z1", "z2", "z3", "z5", "z4", "z6", "z7"])
+  start(f, "z8")
+  on(f, "POST /openai/deployments/whisper/audio/transcriptions", [(200, none, "{\"text\":\"Hello there.\"}")])
+  on(f, "POST /openai/deployments/whisper/audio/translations", [(200, none, "{\"text\":\"Good morning.\"}")])
+  on(f, "POST /openai/deployments/tts/audio/speech", [(200, [("content-type", "audio/mpeg")], "ID3")])
+  let wav = openai.FileUpload{data: b"RIFFWAVE", filename: "hello.wav", content_type: "audio/wav"}
+  match azr.transcribe(openai.TranscriptionParams{file: wav, model: "whisper", response_format: "json"}) {
+    Ok(t) => show(f, "azure transcription", "text=${q(t.text)}")
+    Err(e) => show_err(f, "azure transcription", e)
+  }
+  match azr.translate(openai.TranslationParams{file: wav, model: "whisper"}) {
+    Ok(t) => show(f, "azure translation", "text=${q(t)}")
+    Err(e) => show_err(f, "azure translation", e)
+  }
+  match azr.speech(openai.SpeechParams{input: "Hi", model: "tts", voice: "alloy"}) {
+    Ok(s) => show(f, "azure speech", "status=${s.status} type=${s.content_type} bytes=${s.data.to_hex()}")
+    Err(e) => show_err(f, "azure speech", e)
+  }
+
+  compare(f, ["z1", "z2", "z3", "z5", "z4", "z6", "z7", "z8"])
 }
 
 const RESP_TEXT: Str = "{\"id\":\"resp_1\",\"object\":\"response\",\"created_at\":1741476542,\"status\":\"completed\",\"model\":\"gpt-4o-2024-08-06\",\"output\":[{\"type\":\"message\",\"id\":\"msg_1\",\"status\":\"completed\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Forgetting \",\"annotations\":[]},{\"type\":\"output_text\",\"text\":\"is loss.\",\"annotations\":[]}]}],\"usage\":{\"input_tokens\":36,\"input_tokens_details\":{\"cached_tokens\":4},\"output_tokens\":87,\"output_tokens_details\":{\"reasoning_tokens\":0},\"total_tokens\":123}}"

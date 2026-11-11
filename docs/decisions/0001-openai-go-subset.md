@@ -131,10 +131,32 @@ same encoder (`form.xo`).
 - Deferred: variations, streamed generation and edits, the GIF and SVG
   options. Vectors: i1 to i5 and z7 (the boundary masked on both sides).
 
+## Amendment 4 (2026-11-10): audio
+
+Go's azopenai examples call `Audio.Transcriptions.New`,
+`Audio.Translations.New` and `Audio.Speech.New` once each.
+
+- `transcribe` (POST audio/transcriptions) and `translate` (POST
+  audio/translations) as multipart forms through `form.xo`: a list
+  field is `name[]` for each value (`include[]`,
+  `timestamp_granularities[]`), a float is Go's FormatFloat 'f' -1
+  (`to_fixed(-1)`). The result of `transcribe` holds Go's response
+  union's fields (text, language, duration, segments, the tokens or
+  duration usage) with `raw`; `translate` gives the text.
+- `speech` (POST audio/speech, JSON, `Accept:
+  application/octet-stream`) gives the status, content type and bytes,
+  as Go's *http.Response.
+- The `azure` package routes all three by model: the form's `model`
+  part for transcriptions and translations, the JSON `model` for
+  speech.
+- Deferred: streamed transcriptions, the text, srt and vtt formats (Go
+  points those at Client.Post), chunking strategy, known speakers,
+  custom voices and voice consents. Vectors: a1 to a5 and z8.
+
 ## Deferred
 
 The rest of the Responses API (Amendment 2), assistants, threads and the other
-beta APIs, audio, image variations and streaming, files and uploads, batches, fine tuning,
+beta APIs, streamed audio and custom voices, image variations and streaming, files and uploads, batches, fine tuning,
 vector stores, moderation, models, containers, the admin APIs,
 realtime and websockets, webhooks, the Bedrock and other provider
 packages, and `azopenai`'s re-ported helpers that need the client.

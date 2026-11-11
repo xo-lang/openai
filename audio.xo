@@ -1,0 +1,162 @@
+// Audio: transcriptions and translations (multipart forms) and speech.
+//
+// Ported from github.com/openai/openai-go v3.98.0 (audiotranscription.go,
+// audiotranslation.go, audiospeech.go), Copyright 2026 OpenAI, Apache
+// License 2.0. Changed from the original: rewritten in Xo; a subset of
+// the parameters (the rest through `extra`); no streamed transcriptions
+// (NOTICE.md).
+
+use std/json
+
+/// Go's AudioTranscriptionNewParams (a subset; other text fields through
+/// `extra`). `response_format` is "json", "verbose_json", "text", "srt",
+/// "vtt" or "" (omitted); this call decodes the JSON ones.
+pub struct TranscriptionParams {
+  pub file: FileUpload
+  pub model: Str
+  pub language: Str? = None
+  pub prompt: Str? = None
+  pub temperature: Float? = None
+  /// Go's TranscriptionInclude values ("logprobs").
+  pub include: List[Str] = []
+  pub response_format: Str = ""
+  /// "word", "segment".
+  pub timestamp_granularities: List[Str] = []
+  pub extra: List[(Str, Str)] = []
+}
+
+fn (p: TranscriptionParams) form() -> List[(Str, FormValue)] {
+  var f: List[(Str, FormValue)] = [("file", FormValue.File(p.file)), ("model", FormValue.Text(p.model))]
+  f = f + opt_form_str("language", p.language) + opt_form_str("prompt", p.prompt) + opt_form_num("temperature", p.temperature)
+  f = f + form_list("include", p.include) + form_nonempty("response_format", p.response_format)
+  f = f + form_list("timestamp_granularities", p.timestamp_granularities)
+  for (k, v) in p.extra {
+    f.push((k, FormValue.Text(v)))
+  }
+  f
+}
+
+/// Go's AudioTranslationNewParams.
+pub struct TranslationParams {
+  pub file: FileUpload
+  pub model: Str
+  pub prompt: Str? = None
+  pub temperature: Float? = None
+  pub response_format: Str = ""
+  pub extra: List[(Str, Str)] = []
+}
+
+fn (p: TranslationParams) form() -> List[(Str, FormValue)] {
+  var f: List[(Str, FormValue)] = [("file", FormValue.File(p.file)), ("model", FormValue.Text(p.model))]
+  f = f + opt_form_str("prompt", p.prompt) + opt_form_num("temperature", p.temperature) + form_nonempty("response_format", p.response_format)
+  for (k, v) in p.extra {
+    f.push((k, FormValue.Text(v)))
+  }
+  f
+}
+
+/// A segment of a verbose transcription (Go's TranscriptionSegment, its
+/// times and text).
+pub struct TranscriptionSegment {
+  pub id: Int = 0
+  pub start: Float = 0.0
+  pub end: Float = 0.0
+  pub text: Str = ""
+}
+
+/// Go's transcription usage union: `kind` "tokens" (the token counts) or
+/// "duration" (`seconds`).
+pub struct TranscriptionUsage {
+  pub kind: Str = ""
+  pub input_tokens: Int = 0
+  pub output_tokens: Int = 0
+  pub total_tokens: Int = 0
+  pub seconds: Float = 0.0
+}
+
+/// Go's AudioTranscriptionNewResponseUnion: a Transcription or a
+/// TranscriptionVerbose, their fields in one value; `raw` for the rest
+/// (logprobs, words).
+pub struct Transcription {
+  pub text: Str = ""
+  pub language: Str = ""
+  pub duration: Float = 0.0
+  pub segments: List[TranscriptionSegment] = []
+  pub usage: TranscriptionUsage = TranscriptionUsage{}
+  pub raw: json.Value = json.Value.Null
+}
+
+fn float_of(v: json.Value, k: Str) -> Float {
+  match v.get(k) {
+    Some(json.Value.Num(f)) => f
+    Some(json.Value.Int(n)) => Float(n)
+    _ => 0.0
+  }
+}
+
+fn transcription_of(v: json.Value) -> Transcription {
+  let u = obj_of(v, "usage")
+  Transcription{
+    text: str_of(v, "text"),
+    language: str_of(v, "language"),
+    duration: float_of(v, "duration"),
+    segments: list_of(v, "segments").map(fn(s: json.Value) -> TranscriptionSegment { TranscriptionSegment{id: int_of(s, "id"), start: float_of(s, "start"), end: float_of(s, "end"), text: str_of(s, "text")} }),
+    usage: TranscriptionUsage{kind: str_of(u, "type"), input_tokens: int_of(u, "input_tokens"), output_tokens: int_of(u, "output_tokens"), total_tokens: int_of(u, "total_tokens"), seconds: float_of(u, "seconds")},
+    raw: v,
+  }
+}
+
+/// Go's Audio.Transcriptions.New: POST audio/transcriptions, a multipart
+/// form.
+pub fn (c: Client[fx]) transcribe(p: TranscriptionParams, co: CallOptions = CallOptions{}) -> Transcription ! OpenAIErr uses (net.dial, clock, rand, fx) {
+  Ok(transcription_of(c.call_raw("POST", "audio/transcriptions", Some(c.form_body(p.form())), co)?))
+}
+
+/// Go's Audio.Translations.New: POST audio/translations; the English
+/// text.
+pub fn (c: Client[fx]) translate(p: TranslationParams, co: CallOptions = CallOptions{}) -> Str ! OpenAIErr uses (net.dial, clock, rand, fx) {
+  Ok(str_of(c.call_raw("POST", "audio/translations", Some(c.form_body(p.form())), co)?, "text"))
+}
+
+/// Go's AudioSpeechNewParams. `voice` is a built in voice's name
+/// ("alloy", ...); `response_format` "mp3", "opus", "aac", "flac", "wav",
+/// "pcm" or "" (omitted).
+pub struct SpeechParams {
+  pub input: Str
+  pub model: Str
+  pub voice: Str
+  pub instructions: Str? = None
+  pub speed: Float? = None
+  pub response_format: Str = ""
+  /// "sse" or "audio"; "" is omitted.
+  pub stream_format: Str = ""
+  pub extra: List[(Str, json.Value)] = []
+}
+
+/// The request body in Go's field order.
+pub fn (p: SpeechParams) to_json() -> json.Value {
+  var f: List[(Str, json.Value)] = [("input", jstr(p.input))]
+  f = f + opt_nonempty("model", p.model) + opt_nonempty("voice", p.voice)
+  f = f + opt_str("instructions", p.instructions) + opt_num("speed", p.speed)
+  f = f + opt_nonempty("response_format", p.response_format) + opt_nonempty("stream_format", p.stream_format)
+  for x in p.extra {
+    f.push(x)
+  }
+  json.Value.Object(f)
+}
+
+/// The audio Go's Audio.Speech.New returns as its *http.Response: the
+/// status, the content type and the bytes.
+pub struct Speech {
+  pub status: Int
+  pub content_type: Str
+  pub data: Bytes
+}
+
+/// Go's Audio.Speech.New: POST audio/speech with `Accept:
+/// application/octet-stream` (a call option's Accept wins).
+pub fn (c: Client[fx]) speech(p: SpeechParams, co: CallOptions = CallOptions{}) -> Speech ! OpenAIErr uses (net.dial, clock, rand, fx) {
+  let o = CallOptions{max_retries: co.max_retries, headers: [("Accept", "application/octet-stream")] + co.headers, query: co.query}
+  let r = c.execute("POST", "audio/speech", Some(p.to_json()), o)?
+  Ok(Speech{status: r.status, content_type: r.header("Content-Type") ?? "", data: r.body})
+}
