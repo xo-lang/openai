@@ -95,14 +95,14 @@ pub fn (e: OpenAIErr) display() -> Str {
 /// An OpenAI API client (Go's openai.Client).
 pub struct Client[fx: Effects] {
   http: http.Client
-  clock: Clock
-  rand: Rand
+  clock: Clock[clock]
+  rand: Rand[rand]
   o: Options[fx]
 }
 
 /// A client sending through `net` (Go's openai.NewClient with these
 /// options; no environment variables are read: see `from_env`).
-pub fn new_client[fx: Effects](net: Net, clock: Clock, rand: Rand, o: Options[fx]) -> Client[fx] {
+pub fn new_client[fx: Effects](net: Net, clock: Clock[clock], rand: Rand[rand], o: Options[fx]) -> Client[fx] {
   Client{http: http.client(net, timeout: 600s), clock: clock, rand: rand, o: o}
 }
 
